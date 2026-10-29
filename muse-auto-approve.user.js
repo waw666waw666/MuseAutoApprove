@@ -1,12 +1,11 @@
 // ==UserScript==
 // @name         Muse 自动审批 (经典穿透 + 迷你拖拽融合版)
 // @namespace    https://github.com/waw666waw666/MuseAutoApprove
-// @version      6.3
+// @version      6.4
 // @description  智能穿透 Closed Shadow DOM 与 iframe 沙盒，全自动审批 Muse.ai 助手权限；升级为迷你可拖拽、状态记忆的悬浮胶囊
 // @author       waw666waw666
 // @match        *://muse.ai/*
 // @match        *://*.muse.ai/*
-// @match        *://*/*
 // @run-at       document-start
 // @grant        unsafeWindow
 // @license      MIT
