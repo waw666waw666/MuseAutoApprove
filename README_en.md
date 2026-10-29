@@ -136,8 +136,10 @@ MuseAutoApprove/
 
 ## Disclaimer
 
-- This tool is intended solely for educational, research, and personal workflow automation purposes. Please ensure compliance with the terms of service of the target platform.
-- The author assumes no responsibility for any unintended operations or data modifications resulting from the use of this tool.
+1. **Purpose & Scope**: This tool is provided solely for educational, technical research, and personal workflow automation purposes. Users must independently ensure strict compliance with the Terms of Service and policies of any target platform (including but not limited to Muse.ai).
+2. **Account & Restriction Risks**: This tool automates UI approval workflows via synthetic event dispatch. Any potential consequences resulting from automated interactions—including but not limited to **account suspension, banning, freezing, rate-limiting, feature throttling, or risk-control flagging**—are the sole responsibility of the user.
+3. **Data & Asset Liability**: Automated approvals rapidly authorize actions (such as file uploads and public link generation) without manual intervention. The author shall not be held liable for any accidental misoperations, data modifications, privacy exposure, or potential financial losses.
+4. **Provided "AS IS"**: This project is provided on an "AS IS" basis without warranty of any kind, express or implied. Downloading, installing, or using this tool constitutes full acknowledgment and acceptance of all terms in this disclaimer.
 
 ---
 
