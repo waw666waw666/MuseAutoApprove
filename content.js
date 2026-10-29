@@ -1,6 +1,7 @@
 (function () {
     'use strict';
 
+    // 免责声明：本扩展仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const isTop = (win.self === win.top);
 
