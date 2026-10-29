@@ -1,0 +1,16 @@
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and runtime
+*.log
+
+# Editor directories
+.vscode/
+.idea/
+
+# Large raw video recordings (keep demo GIF & preview PNG in assets)
+*.mp4
+*.mov
+*.avi
