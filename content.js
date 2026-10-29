@@ -5,6 +5,11 @@
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const isTop = (win.self === win.top);
 
+    // 域名硬拦截：无论主窗口还是任何子 iframe，只要不是 muse.ai 站点，一律绝不执行任何操作、绝不篡改任何原型链
+    if (!win.location.hostname.includes('muse.ai')) {
+        return;
+    }
+
     // 1. 强行破解 Closed Shadow DOM
     const shadowRoots = new Set();
     const origAttachShadow = Element.prototype.attachShadow;

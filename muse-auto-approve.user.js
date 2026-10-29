@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Muse 自动审批 (经典穿透 + 迷你拖拽融合版)
 // @namespace    https://github.com/waw666waw666/MuseAutoApprove
-// @version      6.4
+// @version      6.4.1
 // @description  智能穿透 Closed Shadow DOM 与 iframe 沙盒，全自动审批 Muse.ai 助手权限；升级为迷你可拖拽、状态记忆的悬浮胶囊
 // @author       waw666waw666
 // @match        *://muse.ai/*
@@ -20,8 +20,8 @@
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const isTop = (win.self === win.top);
 
-    // 顶层窗口若非 muse.ai 站点则不激活，避免在其他无关网页显示悬浮窗及多余轮询
-    if (isTop && !win.location.hostname.includes('muse.ai')) {
+    // 域名硬拦截：无论主窗口还是任何子 iframe，只要不是 muse.ai 站点，一律绝不执行任何操作、绝不篡改任何原型链
+    if (!win.location.hostname.includes('muse.ai')) {
         return;
     }
 
