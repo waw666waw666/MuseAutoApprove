@@ -62,9 +62,20 @@
    - [Tampermonkey (篡改猴)](https://www.tampermonkey.net/)
    - [Violentmonkey (暴力猴)](https://violentmonkey.github.io/)
    - [ScriptCat (脚本猫)](https://docs.scriptcat.org/)
-2. 打开仓库中的 [`muse-auto-approve.user.js`](./muse-auto-approve.user.js) 脚本文件。
-3. 点击页面右上角 **Raw** 按钮，脚本管理器将自动弹出安装界面，点击 **安装** 即可。
-4. 打开 [muse.ai](https://muse.ai)，页面右上角即可看到控制胶囊。
+
+2. **重要设置（针对 Chrome / Edge 最新版）**：  
+   在基于 Chromium 的新版浏览器（Chrome 126+ 等）中，受安全策略限制，必须手动允许油猴运行用户脚本，否则脚本将无法注入页面：
+   - 打开浏览器地址栏输入 `chrome://extensions/` 进入扩展管理页。
+   - 找到已安装的 Tampermonkey（篡改猴），点击进入**“详细信息”**。
+   - 找到并开启 **「允许运行用户脚本」** 开关（如下图所示；若未找到该选项，请先在扩展管理页右上角开启“开发者模式”）。
+
+   <p align="center">
+     <img src="assets/tampermonkey-permission.png" alt="允许运行用户脚本设置" width="600" />
+   </p>
+
+3. 打开仓库中的 [`muse-auto-approve.user.js`](./muse-auto-approve.user.js) 脚本文件。
+4. 点击页面右上角 **Raw** 按钮，脚本管理器将自动弹出安装界面，点击 **安装** 即可。
+5. 打开 [muse.ai](https://muse.ai)，页面右上角即可看到控制胶囊。
 
 ### 方式二：Chrome 扩展安装（开发者模式）
 
@@ -93,15 +104,16 @@
 
 ```text
 MuseAutoApprove/
-├── manifest.json              # Chrome 扩展配置文件 (Manifest V3)
-├── content.js                 # 扩展端 Content Script
-├── muse-auto-approve.user.js  # 油猴/用户脚本端源码 (带规范元数据头)
-├── icons/                     # 扩展图标 (16x16, 48x48, 128x128)
-├── assets/                    # 演示动图与截图素材
-│   ├── demo.gif               # 演示动图
-│   └── preview.png            # 高清截图
-├── LICENSE                    # MIT 开源协议
-└── README.md                  # 项目详细文档
+├── manifest.json                  # Chrome 扩展配置文件 (Manifest V3)
+├── content.js                     # 扩展端 Content Script
+├── muse-auto-approve.user.js      # 油猴/用户脚本端源码 (带规范元数据头)
+├── icons/                         # 扩展图标 (16x16, 48x48, 128x128)
+├── assets/                        # 演示动图与截图素材
+│   ├── demo.gif                   # 演示动图
+│   ├── preview.png                # 高清截图
+│   └── tampermonkey-permission.png# 允许运行用户脚本权限配置示例图
+├── LICENSE                        # MIT 开源协议
+└── README.md                      # 项目详细文档
 ```
 
 ---
