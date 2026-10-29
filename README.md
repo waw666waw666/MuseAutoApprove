@@ -92,14 +92,14 @@
 
 ### 方式二：Chrome 扩展安装（开发者模式）
 
-1. 将本仓库下载为 ZIP 压缩包并解压（或直接 `git clone`）。
+1. 前往 [Releases 发布页](https://github.com/waw666waw666/MuseAutoApprove/releases) 直接下载打包好的 `MuseAutoApprove-v6.3.zip` 并解压（或直接下载/克隆本仓库）。
 2. 在 Chromium 浏览器（Chrome、Edge、Brave、Arc 等）地址栏输入：
    ```text
    chrome://extensions/
    ```
 3. 在右上角开启“开发者模式 (Developer mode)”。
 4. 点击左上角“加载已解压的扩展程序 (Load unpacked)”。
-5. 选择解压后的项目根文件夹即可完成加载。
+5. 选择解压后的文件夹即可完成加载。
 
 ---
 
