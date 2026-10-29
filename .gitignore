@@ -14,3 +14,7 @@ desktop.ini
 *.mp4
 *.mov
 *.avi
+
+# Build archives
+*.zip
+dist/

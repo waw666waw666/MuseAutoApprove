@@ -10,6 +10,8 @@
 // @run-at       document-start
 // @grant        unsafeWindow
 // @license      MIT
+// @updateURL    https://raw.githubusercontent.com/waw666waw666/MuseAutoApprove/main/muse-auto-approve.user.js
+// @downloadURL  https://raw.githubusercontent.com/waw666waw666/MuseAutoApprove/main/muse-auto-approve.user.js
 // ==/UserScript==
 
 (function () {
@@ -17,6 +19,11 @@
 
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const isTop = (win.self === win.top);
+
+    // 顶层窗口若非 muse.ai 站点则不激活，避免在其他无关网页显示悬浮窗及多余轮询
+    if (isTop && !win.location.hostname.includes('muse.ai')) {
+        return;
+    }
 
     // 1. 强行破解 Closed Shadow DOM（保持不变，确保能穿透封闭组件）
     const shadowRoots = new Set();
