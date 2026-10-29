@@ -63,7 +63,7 @@
    - [Violentmonkey (暴力猴)](https://violentmonkey.github.io/)
    - [ScriptCat (脚本猫)](https://docs.scriptcat.org/)
 
-2. **重要设置（针对 Chrome / Edge 最新版）**：  
+2. **前置权限（针对 Chrome / Edge 最新版）**：  
    在基于 Chromium 的新版浏览器（Chrome 126+ 等）中，受安全策略限制，必须手动允许油猴运行用户脚本，否则脚本将无法注入页面：
    - 打开浏览器地址栏输入 `chrome://extensions/` 进入扩展管理页。
    - 找到已安装的 Tampermonkey（篡改猴），点击进入**“详细信息”**。
@@ -73,9 +73,22 @@
      <img src="assets/tampermonkey-permission.png" alt="允许运行用户脚本设置" width="600" />
    </p>
 
-3. 打开仓库中的 [`muse-auto-approve.user.js`](./muse-auto-approve.user.js) 脚本文件。
-4. 点击页面右上角 **Raw** 按钮，脚本管理器将自动弹出安装界面，点击 **安装** 即可。
-5. 打开 [muse.ai](https://muse.ai)，页面右上角即可看到控制胶囊。
+3. **添加并安装脚本（两种途径任选）**：
+
+   - **途径 A：手动添加脚本（最稳妥，推荐）**
+     1. 打开本仓库的 [`muse-auto-approve.user.js`](./muse-auto-approve.user.js) 文件，完整复制全部源码。
+     2. 点击浏览器右上角工具栏的 Tampermonkey 图标，在弹出菜单中点击 **「添加新脚本...」**（如下图所示）。
+     3. 清空编辑器中的原有模板内容，粘贴刚才复制的代码。
+     4. 按快捷键 `Ctrl + S`（Mac 为 `Cmd + S`）或点击左上角“文件 -> 保存”即可完成安装。
+
+     <p align="center">
+       <img src="assets/tampermonkey-add-script.png" alt="油猴菜单添加新脚本" width="420" />
+     </p>
+
+   - **途径 B：在线一键安装**
+     - 打开本仓库的 [`muse-auto-approve.user.js`](./muse-auto-approve.user.js) 页面，点击右上角的 **Raw** 按钮，Tampermonkey 将自动弹出安装界面，点击“安装”即可。
+
+4. 打开 [muse.ai](https://muse.ai)，页面右上角即可看到控制胶囊。
 
 ### 方式二：Chrome 扩展安装（开发者模式）
 
@@ -111,7 +124,8 @@ MuseAutoApprove/
 ├── assets/                        # 演示动图与截图素材
 │   ├── demo.gif                   # 演示动图
 │   ├── preview.png                # 高清截图
-│   └── tampermonkey-permission.png# 允许运行用户脚本权限配置示例图
+│   ├── tampermonkey-permission.png# 允许运行用户脚本权限配置示例图
+│   └── tampermonkey-add-script.png# 油猴菜单点击“添加新脚本...”示例图
 ├── LICENSE                        # MIT 开源协议
 └── README.md                      # 项目详细文档
 ```
