@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Muse 自动审批助手",
-  "version": "6.3",
+  "version": "6.4",
   "description": "智能穿透 Closed Shadow DOM 与 iframe 沙盒，全自动审批 Muse.ai 助手权限，支持迷你可拖拽悬浮窗",
   "icons": {
     "16": "icons/icon16.png",

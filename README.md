@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-6.3-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-6.4-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -53,6 +53,9 @@
   - **左键单击**：一键切换“自动运行 / 暂停”状态。
   - **右键单击**：一键清零审批累计计数。
   - **视觉体验**：毛玻璃磨砂质感与指示点，小巧不遮挡操作区。
+
+- **严格作用域隔离（零跨站干扰）**  
+  匹配规则严格限定在 `muse.ai` 域名下，彻底移除全网匹配。绝不在任何外部站点注入执行，杜绝因改写原型链破坏 Cloudflare (Turnstile) 人机验证组件，彻底消除在 GitHub / Discord 等第三方平台误点授权的隐患。
 
 ---
 
@@ -96,7 +99,7 @@
 
 ### 方式二：Chrome 扩展安装（开发者模式）
 
-1. 前往 [Releases 发布页](https://github.com/waw666waw666/MuseAutoApprove/releases) 直接下载打包好的 `MuseAutoApprove-v6.3.zip` 并解压（或直接下载/克隆本仓库）。
+1. 前往 [Releases 发布页](https://github.com/waw666waw666/MuseAutoApprove/releases) 直接下载打包好的 `MuseAutoApprove-v6.4.zip` 并解压（或直接下载/克隆本仓库）。
 2. 在 Chromium 浏览器（Chrome、Edge、Brave、Arc 等）地址栏输入：
    ```text
    chrome://extensions/
