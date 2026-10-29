@@ -5,6 +5,10 @@
 </p>
 
 <p align="center">
+  <b>简体中文</b> · <a href="README_en.md">English</a>
+</p>
+
+<p align="center">
   <b>专为 <a href="https://muse.ai">Muse.ai</a> 打造的自动化权限审批工具</b><br>
   双模支持：Chrome 原生扩展 (Manifest V3) + 油猴用户脚本 (Tampermonkey)<br>
   穿透封闭组件 · 穿透 iframe 沙盒 · 真实合成事件流 · 迷你拖拽记忆胶囊
@@ -127,7 +131,8 @@ MuseAutoApprove/
 │   ├── tampermonkey-permission.png# 允许运行用户脚本权限配置示例图
 │   └── tampermonkey-add-script.png# 油猴菜单点击“添加新脚本...”示例图
 ├── LICENSE                        # MIT 开源协议
-└── README.md                      # 项目详细文档
+├── README.md                      # 项目详细文档 (简体中文)
+└── README_en.md                   # 英文说明文档 (English)
 ```
 
 ---
