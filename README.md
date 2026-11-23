@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-7.0.0-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-7.0.1-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -37,7 +37,7 @@
   自动提取页面 React Fiber 中的 `HatchRpc` 通道，后台直接应答 `egress.approvals` 待审批列表；遇到不走 RPC 的前端弹窗（如文件上传、创建公开链接等），DOM 穿透引擎礼让防撞后自动接管点击，两路无缝互补。
 
 - **严格档位优先（全部 / 永久允许优先，降级兜底单个允许）**  
-  RPC 侧默认先发 `allow_always`（永久允许），遇到服务端限制仅允许单次的项目自动降级为 `allow_once`；页面点击侧支持四级档位排序（`全部允许 / 全部永久允许` > `永久允许 / 始终允许 / Allow always / Always allow` > `全部允许一次` > `允许 / Allow / Approve`），自动剥离按钮角标数字（如 `全部允许 (3)`）。
+  RPC 侧默认先发 `allow_always`（永久允许），遇到服务端限制仅允许单次的项目自动降级为 `allow_once`；页面点击侧支持五级档位排序（`全部允许 / 全部永久允许` > `永久允许 / 始终允许 / 始终允许此网站 / 始终允许此连接器 / Always allow this site` > `全部允许一次` > `此网站内允许 / 此任务内允许 / Allow for this site / Allow for this task` > `允许 / Allow / Approve`），自动剥离按钮角标数字（如 `全部允许 (3)`）。
 
 - **审批上下文强校验（根治误点）**  
   不再盲点全页任意“允许 / Allow / Approve”按钮；仅对包含配对拒绝/取消按钮或明确审批提示语的确认卡片动手，自动跳过导航栏、代码块、设置开关及禁用按钮。
@@ -127,6 +127,8 @@ MuseAutoApprove/
 ├── manifest.json                  # Chrome 扩展配置文件 (Manifest V3)
 ├── content.js                     # 扩展端 Content Script
 ├── muse-auto-approve.user.js      # 油猴/用户脚本端源码 (带规范元数据头)
+├── tests/
+│   └── auto-approve.test.mjs      # 7 组自动化沙箱单元测试 (node tests/auto-approve.test.mjs)
 ├── icons/                         # 扩展图标 (16x16, 48x48, 128x128)
 ├── assets/                        # 演示动图与截图素材
 │   ├── demo.gif                   # 演示动图

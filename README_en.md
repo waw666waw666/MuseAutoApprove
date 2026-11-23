@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-7.0.0-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-7.0.1-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -37,7 +37,7 @@ Automatically detects permission dialogs on Muse (file uploads, tool executions,
   Extracts Muse's `HatchRpc` context via React Fiber to silently approve `egress.approvals` in-flight, while the DOM penetration engine handles client-only cards (file uploads, public links, etc.) with smart RPC handoff to prevent duplicate triggers.
 
 - **Strict Tier Priority (Always / All First, Single Fallback)**  
-  RPC prioritizes `allow_always` and automatically degrades to `allow_once` when server policy forbids permanent approval. DOM clicking ranks buttons across 4 tiers (`Allow all` / `Always allow all` > `Allow always` / `Always allow` > `Allow all once` > `Allow` / `Approve`) and normalizes badge counts like `Allow all (3)`.
+  RPC prioritizes `allow_always` and automatically degrades to `allow_once` when server policy forbids permanent approval. DOM clicking ranks buttons across 5 tiers (`Allow all` / `Always allow all` > `Allow always` / `Always allow` / `Always allow this site` > `Allow all once` > `Allow for this site` / `Allow for this task` > `Allow` / `Approve`) and normalizes badge counts like `Allow all (3)`.
 
 - **Context-Aware Anti-Misclick Protection**  
   Verifies approval context (paired Deny/Reject/Cancel buttons or approval prompts) before clicking and excludes navigation bars, code blocks, settings switches, and disabled buttons.
@@ -123,6 +123,8 @@ MuseAutoApprove/
 ├── manifest.json                  # Chrome Extension Manifest (V3)
 ├── content.js                     # Extension Content Script
 ├── muse-auto-approve.user.js      # Userscript source (with standard metadata headers)
+├── tests/
+│   └── auto-approve.test.mjs      # 7-suite sandbox unit tests (node tests/auto-approve.test.mjs)
 ├── icons/                         # Extension icons (16x16, 48x48, 128x128)
 ├── assets/                        # Demo GIF & screenshot assets
 │   ├── demo.gif                   # Animation demo

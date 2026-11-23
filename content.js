@@ -2,7 +2,7 @@
     'use strict';
 
     // 免责声明：本扩展仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.0.0';
+    const VERSION = '7.0.1';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -813,7 +813,7 @@
     }
 
     // =========================================================================
-    // 引擎 B：DOM 穿透精准点击引擎（四级档位 + 上下文防误点 + 验成败计数）
+    // 引擎 B：DOM 穿透精准点击引擎（五级档位 + 上下文防误点 + 验成败计数）
     // =========================================================================
 
     const NEGATIVE_RE = /拒绝|不允许|不同意|取消|暂不|停止|删除|移除|撤回|关闭|退出|\b(deny|reject|disallow|cancel|decline|block|revoke|delete|remove|dismiss|close)\b/i;
@@ -825,13 +825,14 @@
         '请求权限', '权限请求', '待审批', '审批请求', '操作确认',
         '允许 muse', '允许muse', '允许此操作', '允许该操作',
         '上传这个文件', '上传文件', '创建公开链接', '公开链接', '授予权限',
+        '把信息分享给', 'share information with',
         'approval required', 'permission required', 'pending approval',
         'needs approval', 'requires approval', 'requesting permission',
         'allow muse', 'approve action', 'approve this', 'grant permission',
         'wants to', 'upload this file', 'public link', 'confirm action',
     ];
 
-    // 四级档位词典（严格优先：全部/永久 > 永久/始终 > 批量单次 > 单个允许）
+    // 五级档位词典（严格优先：全部/永久 > 永久/始终 > 批量单次 > 范围/任务内 > 单个允许）
     const TIER1_EXACT = new Set([
         '全部永久允许', '全部始终允许', '始终全部允许', '永久全部允许',
         '全部允许', '允许全部', '全部批准', '批准全部', '一律允许', '全部同意',
@@ -839,13 +840,19 @@
     ]);
     const TIER2_EXACT = new Set([
         '永久允许', '始终允许', '总是允许', '一直允许', '永久批准', '始终批准', '一律放行',
-        'allow always', 'always allow', 'approve always', 'always approve', 'permit always', 'trust always',
+        '始终允许此网站', '始终允许此连接器',
+        'allow always', 'always allow', 'always allow this site', 'always allow this connector',
+        'approve always', 'always approve', 'permit always', 'trust always',
     ]);
     const TIER3_EXACT = new Set([
         '全部允许一次', '全部批准一次', '本次全部允许', '允许全部一次',
         'allow all once', 'approve all once',
     ]);
     const TIER4_EXACT = new Set([
+        '此网站内允许', '此任务内允许',
+        'allow for this site', 'allow for this task',
+    ]);
+    const TIER5_EXACT = new Set([
         '允许', '允许一次', '本次允许', '仅允许本次', '仅此一次', '批准', '批准一次', '确认允许', '同意',
         'allow', 'allow once', 'approve', 'approve once', 'permit',
     ]);
@@ -924,15 +931,16 @@
     }
 
     function classifyButtonTier(rawText) {
-        if (!rawText || rawText.length > 36) return 0;
+        if (!rawText || rawText.length > 44) return 0;
         if (NEGATIVE_RE.test(rawText)) return 0;
         const norm = normalizeButtonText(rawText);
-        if (!norm || norm.length > 28) return 0;
+        if (!norm || norm.length > 34) return 0;
         if (NEGATIVE_RE.test(norm)) return 0;
         if (TIER1_EXACT.has(norm)) return 1;
         if (TIER2_EXACT.has(norm)) return 2;
         if (TIER3_EXACT.has(norm)) return 3;
         if (TIER4_EXACT.has(norm)) return 4;
+        if (TIER5_EXACT.has(norm)) return 5;
         return 0;
     }
 
@@ -1014,9 +1022,9 @@
             cur = getParentAcrossShadow(cur);
         }
 
-        // 判据 3：Tier 1~3 属于高置信度批量/永久审批专有词，标准交互按钮且非设置控件允许放行
-        if (tier <= 3 && isStandardInteractive) {
-            return { ok: true, clue: `专有批量档位T${tier}` };
+        // 判据 3：Tier 1~4 属于高置信度批量/永久/范围审批专有词，标准交互按钮且非设置控件允许放行
+        if (tier <= 4 && isStandardInteractive) {
+            return { ok: true, clue: `专有审批档位T${tier}` };
         }
 
         return { ok: false };
