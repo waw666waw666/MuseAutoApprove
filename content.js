@@ -2,7 +2,7 @@
     'use strict';
 
     // 免责声明：本扩展仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.0.1';
+    const VERSION = '7.0.2';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -23,11 +23,13 @@
         activeTeardown: null,
         shadowRefs: new Set(),
         onShadowAttached: null,
-        // RPC 共享状态
+        // RPC 共享状态（第一引擎）
         ctx: null,
         scanAt: 0,
         scanRes: null,
         rpcReady: false,
+        rpcStatusReason: '正在连接审批协议通道...',
+        rpcLastError: null,        // { category, reason, raw, at, count, nextRetryMs }
         inFlight: new Set(),       // 正在请求审批的 approval_id（发请求前占坑防重）
         seen: new Map(),           // 已批准的 approval_id -> timestamp
         failState: new Map(),      // approval_id -> { count, nextTryAt }
@@ -75,9 +77,11 @@
             count: 0,
             rpcCount: 0,
             domCount: 0,
+            lastRpcApprovedAt: 0,
+            lastRpcApprovedLabel: '',
             pos: null,
             decision: 'allow_always',
-            rpcIntervalMs: 1800,
+            rpcIntervalMs: 1200,
             domIntervalMs: 1200,
         };
         try {
@@ -284,6 +288,8 @@
             state.count = 0;
             state.rpcCount = 0;
             state.domCount = 0;
+            state.lastRpcApprovedAt = 0;
+            state.lastRpcApprovedLabel = '';
             lastActionSummary = '计数已清零';
             saveState();
             renderBadge();
@@ -294,6 +300,13 @@
         return badgeRefs;
     };
 
+    const formatClockTime = (ts) => {
+        if (!ts || !Number.isFinite(ts)) return '';
+        const d = new Date(ts);
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    };
+
     const renderBadge = (pulse = false) => {
         if (!isTop || !doc.body || !isActiveGen()) return;
         const refs = ensureBadge();
@@ -301,28 +314,37 @@
 
         const on = state.enabled;
         const rpcOnline = !!G.rpcReady;
+        const lastRpcClock = formatClockTime(state.lastRpcApprovedAt);
 
         refs.el.style.background = on
             ? (rpcOnline
                 ? 'linear-gradient(135deg, rgba(16,185,129,0.94), rgba(5,150,105,0.94))'
-                : 'linear-gradient(135deg, rgba(14,165,133,0.92), rgba(13,148,136,0.92))')
+                : 'linear-gradient(135deg, rgba(217,119,6,0.92), rgba(180,83,9,0.92))')
             : 'linear-gradient(135deg, rgba(75,85,99,0.92), rgba(55,65,81,0.92))';
         refs.el.style.border = on
-            ? '1px solid rgba(167,243,208,0.4)'
+            ? (rpcOnline ? '1px solid rgba(167,243,208,0.42)' : '1px solid rgba(253,230,138,0.42)')
             : '1px solid rgba(156,163,175,0.28)';
 
-        refs.dotEl.style.background = on ? '#a7f3d0' : '#9ca3af';
-        refs.dotEl.style.boxShadow = on ? '0 0 5px #a7f3d0' : 'none';
-        refs.labelEl.textContent = on ? '自动' : '暂停';
-        refs.engineEl.textContent = on ? (rpcOnline ? '双擎' : '点控') : '';
+        refs.dotEl.style.background = on ? (rpcOnline ? '#a7f3d0' : '#fde68a') : '#9ca3af';
+        refs.dotEl.style.boxShadow = on ? (rpcOnline ? '0 0 5px #a7f3d0' : '0 0 5px #fde68a') : 'none';
+        refs.labelEl.textContent = on ? (rpcOnline ? '协议已连' : '协议未连') : '已暂停';
+        refs.engineEl.textContent = on ? (lastRpcClock || (rpcOnline ? '待批' : '兜底中')) : '';
         refs.engineEl.style.display = on ? 'inline' : 'none';
         refs.countEl.textContent = String(state.count);
 
+        const rpcStateLine = rpcOnline
+            ? '协议已连接（第一引擎主动查单中）'
+            : `协议未连接（${G.rpcStatusReason || '等待重连'}；DOM 第二引擎兜底中）`;
+        const lastRpcLine = lastRpcClock
+            ? `${lastRpcClock}${state.lastRpcApprovedLabel ? ' · ' + state.lastRpcApprovedLabel : ''}`
+            : '暂无';
+
         refs.el.title = [
-            `Muse 自动审批 v${VERSION}`,
-            `状态：${on ? '运行中' : '已暂停'} | 通道：${rpcOnline ? 'RPC已连 + 页面兜底' : '页面精点中（后台等RPC连接）'}`,
-            `真实通过：${state.count} 次（直通 ${state.rpcCount} / 点击 ${state.domCount}）`,
-            `最近：${lastActionSummary}`,
+            `Muse 自动审批 v${VERSION}（协议优先版）`,
+            `状态：${on ? '运行中' : '已暂停'} | ${rpcStateLine}`,
+            `最近协议批单：${lastRpcLine}`,
+            `累计批掉：${state.count} 次（协议 ${state.rpcCount} / 页面兜底 ${state.domCount}）`,
+            `最近动作：${lastActionSummary}`,
             '操作：按住拖动 | 左键开关 | 右键清零',
         ].join('\n');
 
@@ -336,11 +358,16 @@
 
     const recordApproved = (source, detailText) => {
         if (!isActiveGen()) return;
-        const summary = `${source === 'rpc' ? '直通' : '点击'} · ${detailText || '已放行'}`;
+        const summary = `${source === 'rpc' ? '协议' : '点控'} · ${detailText || '已放行'}`;
         if (isTop) {
             state.count++;
-            if (source === 'rpc') state.rpcCount++;
-            else state.domCount++;
+            if (source === 'rpc') {
+                state.rpcCount++;
+                state.lastRpcApprovedAt = Date.now();
+                state.lastRpcApprovedLabel = detailText || '已放行';
+            } else {
+                state.domCount++;
+            }
             lastActionSummary = summary;
             saveState();
             renderBadge(true);
@@ -390,6 +417,8 @@
                     if (typeof next.count === 'number') state.count = next.count;
                     if (typeof next.rpcCount === 'number') state.rpcCount = next.rpcCount;
                     if (typeof next.domCount === 'number') state.domCount = next.domCount;
+                    if (typeof next.lastRpcApprovedAt === 'number') state.lastRpcApprovedAt = next.lastRpcApprovedAt;
+                    if (typeof next.lastRpcApprovedLabel === 'string') state.lastRpcApprovedLabel = next.lastRpcApprovedLabel;
                     renderBadge();
                 }
             }
@@ -407,7 +436,7 @@
     };
 
     // =========================================================================
-    // 引擎 A：RPC 静默直通引擎（React 18/19 Fiber 提取 + 永久允许优先 + 自动降级）
+    // 引擎 A（第一引擎）：协议优先主动轮询引擎（React 18/19 双缓冲提取 + 失败显式归因退避）
     // =========================================================================
 
     function fiberOf(el) {
@@ -422,36 +451,58 @@
         return null;
     }
 
-    function findRootFiber() {
+    function findRootFibers() {
+        const roots = [];
+        const seen = new Set();
+        const pushFromFiber = (f) => {
+            if (!f || typeof f !== 'object') return;
+            let r = f;
+            let steps = 0;
+            while (r && r.return && steps++ < 500) r = r.return;
+            // React 18 HostRoot.stateNode.current 始终指向最新已提交树，优先扫描防拿到过期双缓冲快照
+            if (r && r.stateNode && r.stateNode.current && typeof r.stateNode.current === 'object') {
+                const cur = r.stateNode.current;
+                if (!seen.has(cur)) {
+                    seen.add(cur);
+                    roots.push(cur);
+                }
+            }
+            if (r && !seen.has(r)) {
+                seen.add(r);
+                roots.push(r);
+            }
+            if (r && r.alternate && typeof r.alternate === 'object' && !seen.has(r.alternate)) {
+                seen.add(r.alternate);
+                roots.push(r.alternate);
+            }
+        };
+
         const sels = ['#__next', '#root', '#app', '[data-reactroot]', 'main', 'body', 'html'];
         for (const sel of sels) {
             const el = doc.querySelector(sel);
             const f = fiberOf(el);
-            if (f) {
-                let r = f;
-                while (r && r.return) r = r.return;
-                return r || f;
-            }
+            if (f) pushFromFiber(f);
         }
+        if (roots.length) return roots;
+
         const all = doc.querySelectorAll('*');
         const limit = Math.min(all.length, 2500);
         for (let i = 0; i < limit; i++) {
             const f = fiberOf(all[i]);
             if (f) {
-                let r = f;
-                while (r && r.return) r = r.return;
-                return r || f;
+                pushFromFiber(f);
+                if (roots.length) return roots;
             }
         }
-        return null;
+        return roots;
     }
 
     function collectFiberContexts() {
-        const root = findRootFiber();
-        if (!root) return [];
+        const roots = findRootFibers();
+        if (!roots.length) return [];
         const out = [];
         const seen = new Set();
-        const stack = [root];
+        const stack = [...roots].reverse();
         let guard = 0;
         while (stack.length && guard++ < 200000) {
             const f = stack.pop();
@@ -579,7 +630,12 @@
 
     function isConnectionError(err) {
         const msg = (err && err.message) ? err.message : String(err || '');
-        return /not ready|not connected|disconnected|socket|closed|timeout|target|network|reconnect/i.test(msg);
+        return /not ready|not connected|disconnected|socket|closed|timeout|target|network|reconnect|未找到/i.test(msg);
+    }
+
+    function isAuthError(err) {
+        const msg = (err && err.message) ? err.message : String(err || '');
+        return /\b(401|403)\b|unauthorized|unauthenticated|forbidden|permission denied|not authorized|no permission|access denied|auth/i.test(msg);
     }
 
     function isDecisionRejectedError(err) {
@@ -597,8 +653,19 @@
     }
 
     function pendingOf(r) {
+        if (Array.isArray(r)) return r;
         if (!r || typeof r !== 'object') return [];
-        const c = r.pending_approvals ?? (r.approvals && r.approvals.pending) ?? r.pending ?? [];
+        const inner = (r.data && typeof r.data === 'object')
+            ? r.data
+            : ((r.result && typeof r.result === 'object') ? r.result : r);
+        if (Array.isArray(inner)) return inner;
+        const c = inner.pending_approvals
+            ?? inner.pendingApprovals
+            ?? (inner.approvals && inner.approvals.pending)
+            ?? (Array.isArray(inner.approvals) ? inner.approvals : null)
+            ?? inner.pending
+            ?? inner.items
+            ?? [];
         return Array.isArray(c) ? c : [];
     }
 
@@ -689,7 +756,71 @@
     }
 
     let rpcTickRunning = false;
-    let rpcProbeDelay = 1200;
+    let rpcConsecutiveFails = 0;
+    let rpcLastLogKey = '';
+    let rpcLastLogAt = 0;
+    let rpcSameErrCount = 0;
+    let lastEnsureConnAt = 0;
+
+    function nextRpcBackoffMs(failCount) {
+        // 协议失败退避：1.5s -> 3s -> 6s -> 12s -> 24s -> 上限 30s，自动重试不刷屏
+        const exp = Math.min(Math.max(0, failCount - 1), 5);
+        return Math.min(1500 * Math.pow(2, exp), 30000);
+    }
+
+    function reportRpcFailure(category, rawError, nextRetryMs) {
+        const raw = (rawError && rawError.message) ? rawError.message : String(rawError || category);
+        const now = Date.now();
+        const logKey = `${category}|${raw}`;
+        if (logKey === rpcLastLogKey) {
+            rpcSameErrCount++;
+        } else {
+            rpcLastLogKey = logKey;
+            rpcSameErrCount = 1;
+        }
+
+        const reason = raw && raw !== category ? `${category}：${raw}` : category;
+        G.rpcStatusReason = reason;
+        G.rpcLastError = {
+            category,
+            reason,
+            raw,
+            at: now,
+            count: rpcSameErrCount,
+            nextRetryMs,
+        };
+
+        G.rpcLog.push({ type: 'rpc-error', category, error: raw, count: rpcSameErrCount, nextRetryMs, at: now });
+        if (G.rpcLog.length > 200) G.rpcLog.shift();
+
+        // 首次出现、原因变化、或间隔足够长时打印，绝不静默装死，也不刷屏
+        const shouldLog = rpcSameErrCount === 1 || rpcSameErrCount === 3 || (now - rpcLastLogAt >= 30000);
+        if (shouldLog) {
+            rpcLastLogAt = now;
+            const retrySec = Math.max(1, Math.round(nextRetryMs / 1000));
+            console.warn(
+                TAG,
+                `⚠ [协议线异常 #${rpcSameErrCount}] ${reason}（${retrySec}s 后自动重试，期间 DOM 第二引擎兜底）`
+            );
+        }
+        renderBadge();
+    }
+
+    function markRpcHealthy() {
+        const wasOffline = !G.rpcReady || rpcConsecutiveFails > 0;
+        rpcConsecutiveFails = 0;
+        rpcLastLogKey = '';
+        rpcSameErrCount = 0;
+        G.rpcLastError = null;
+        G.rpcStatusReason = '已连接';
+        if (!G.rpcReady) {
+            G.rpcReady = true;
+            renderBadge();
+        }
+        if (wasOffline) {
+            console.log(TAG, '✓ [协议线已连接] 第一引擎主动轮询 egress.approvals 中');
+        }
+    }
 
     function pruneRpcMaps(activeIds) {
         const now = Date.now();
@@ -704,34 +835,63 @@
     async function rpcTick() {
         if (!isTop || !isActiveGen() || rpcTickRunning) return;
         rpcTickRunning = true;
-        let nextDelay = state.rpcIntervalMs || 1800;
+        let nextDelay = state.rpcIntervalMs || 1200;
 
         try {
             if (!state.enabled) {
-                nextDelay = 2000;
+                nextDelay = 1500;
                 return;
             }
 
-            // 探测真正就绪的 context
-            const readyCtx = findRpcCtx({ allowPending: false });
+            // 第一步：获取真正就绪的协议通道（无 DOM 卡也独立持续查询）
+            let readyCtx = findRpcCtx({ allowPending: false });
             if (!readyCtx) {
-                if (G.rpcReady) {
-                    G.rpcReady = false;
-                    renderBadge();
+                const pendingCtx = findRpcCtx({ allowPending: true });
+                const now = Date.now();
+
+                // 若通道处于断开/休眠状态，按退避节奏主动调用 ensureLiveConnection() 拉活，但绝不对 connecting 状态盲发请求
+                if (pendingCtx && typeof pendingCtx.ensureLiveConnection === 'function') {
+                    const st = pendingCtx.connectionState;
+                    const shouldWake = (st === 'disconnected' || st === 'closed' || st === 'error') && (now - lastEnsureConnAt >= 5000);
+                    if (shouldWake) {
+                        lastEnsureConnAt = now;
+                        try {
+                            await pendingCtx.ensureLiveConnection();
+                            invalidateRpcCtx();
+                            readyCtx = findRpcCtx({ allowPending: false });
+                        } catch (wakeErr) {
+                            G.rpcReady = false;
+                            rpcConsecutiveFails++;
+                            nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
+                            reportRpcFailure('连不上', wakeErr, nextDelay);
+                            return;
+                        }
+                    }
                 }
-                rpcProbeDelay = Math.min(Math.round(rpcProbeDelay * 1.25), 5000);
-                nextDelay = rpcProbeDelay;
-                return;
+
+                if (!readyCtx) {
+                    G.rpcReady = false;
+                    rpcConsecutiveFails++;
+                    nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
+                    if (!pendingCtx) {
+                        reportRpcFailure('连不上', '未找到 HatchRpc 通道（页面未进入工作区或 React 尚未挂载）', nextDelay);
+                    } else {
+                        const detail = `通道未就绪（isReady=${String(pendingCtx.isReady)}, connectionState=${String(pendingCtx.connectionState || 'unknown')}）`;
+                        reportRpcFailure('连不上', detail, nextDelay);
+                    }
+                    return;
+                }
             }
 
-            rpcProbeDelay = 1200;
-            if (!G.rpcReady) {
-                G.rpcReady = true;
-                renderBadge();
-                console.log(TAG, 'RPC 直通通道已就绪，双擎协同运行中');
-            }
-
+            // 第二步：主动向审批系统查询待批单子（完全不依赖页面出卡或 DOM 扫描）
             const resp = await rpcCall('egress.approvals', {});
+            if (isRpcResultRejected(resp)) {
+                const errMsg = (resp.error && resp.error.message) || resp.error || resp.message || 'egress.approvals 返回失败';
+                throw new Error(String(errMsg));
+            }
+
+            markRpcHealthy();
+
             const list = pendingOf(resp);
             const activeIds = new Set();
             const now = Date.now();
@@ -755,25 +915,31 @@
                     G.seen.set(id, Date.now());
                     G.failState.delete(id);
                     G.lastRpcApproveAt = Date.now();
-                    const tierLabel = out.decision === 'allow_always' ? '永久允许' : out.decision;
+                    const tierLabel = out.decision === 'allow_always'
+                        ? '永久允许'
+                        : (out.decision === 'allow_once' ? '允许一次' : out.decision);
                     G.rpcLog.push({ id, title, decision: out.decision, ok: true, at: Date.now() });
                     if (G.rpcLog.length > 200) G.rpcLog.shift();
                     recordApproved('rpc', `${tierLabel}${title ? ' · ' + title : ''}`);
-                    console.log(TAG, `✓ [RPC ${tierLabel}]`, id, title);
+                    console.log(TAG, `✓ [协议直批 ${tierLabel}]`, id, title);
                 } catch (err) {
                     const prev = G.failState.get(id) || { count: 0, nextTryAt: 0 };
                     const count = prev.count + 1;
-                    // 指数退避（2s -> 4s -> 8s -> 16s -> 30s -> 45s），永不永久拉黑
+                    // 单项失败指数退避（2s -> 4s -> 8s -> 16s -> 30s -> 45s），永不永久拉黑
                     const backoff = Math.min(2000 * Math.pow(2, Math.min(count - 1, 4)), 45000);
                     G.failState.set(id, { count, nextTryAt: Date.now() + backoff });
                     const msg = (err && err.message) ? err.message : String(err);
                     G.rpcLog.push({ id, title, ok: false, error: msg, count, at: Date.now() });
                     if (G.rpcLog.length > 200) G.rpcLog.shift();
                     if (count <= 2 || count % 5 === 0) {
-                        console.warn(TAG, `✗ [RPC 重试#${count}，${Math.round(backoff / 1000)}s后再试]`, id, msg);
+                        const cat = isAuthError(err) ? '没权限' : (isConnectionError(err) ? '连不上' : '接口报错');
+                        console.warn(TAG, `✗ [协议批单失败:${cat} #${count}，${Math.round(backoff / 1000)}s后再试]`, id, msg);
                     }
                     if (isConnectionError(err)) {
                         invalidateRpcCtx();
+                        rpcConsecutiveFails++;
+                        nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
+                        reportRpcFailure('连不上', err, nextDelay);
                         break;
                     }
                 } finally {
@@ -783,9 +949,14 @@
 
             pruneRpcMaps(activeIds);
         } catch (e) {
+            G.rpcReady = false;
+            rpcConsecutiveFails++;
+            nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
+            const category = isAuthError(e) ? '没权限' : (isConnectionError(e) ? '连不上' : '接口报错');
             if (isConnectionError(e)) {
                 invalidateRpcCtx();
             }
+            reportRpcFailure(category, e, nextDelay);
         } finally {
             rpcTickRunning = false;
             if (isActiveGen()) {
@@ -1481,6 +1652,12 @@
             rpcCount: state.rpcCount,
             domCount: state.domCount,
             rpcReady: G.rpcReady,
+            rpcStatus: G.rpcReady ? 'connected' : 'disconnected',
+            rpcStatusReason: G.rpcStatusReason,
+            rpcLastError: G.rpcLastError,
+            lastRpcApprovedAt: state.lastRpcApprovedAt,
+            lastRpcApprovedTime: formatClockTime(state.lastRpcApprovedAt) || null,
+            domFallbackActive: state.enabled && !G.rpcReady,
             hasReadyCtx: !!readyCtx,
             hasPendingCtx: !!pendingCtx,
             connectionState: pendingCtx ? pendingCtx.connectionState : null,
@@ -1559,20 +1736,17 @@
             renderBadge();
             if (!G.bannerShown) {
                 G.bannerShown = true;
-                console.log(TAG, `v${VERSION} 已加载（RPC直通 + DOM穿透精点双引擎）`);
+                console.log(TAG, `v${VERSION} 已加载（协议优先：RPC第一引擎主动查单 + DOM第二引擎兜底）`);
             }
+            // 第一引擎：协议线立刻主动启动，不等待也不依赖页面出卡
+            owned.rpcTimer = setTimeout(rpcTick, 100);
         }
 
-        // 挂载 DOM 监听与低频兜底巡检
+        // 第二引擎：DOM 穿透点控退居兜底（协议连不上或查不到时接管）
         attachObserver(doc.body || doc.documentElement);
         for (const sr of getActiveShadowRoots()) attachObserver(sr);
         domScan();
         owned.domTimer = setInterval(domScan, state.domIntervalMs || 1200);
-
-        // 顶层启动 RPC 串行轮询（自动等待真实就绪与断连自愈）
-        if (isTop) {
-            owned.rpcTimer = setTimeout(rpcTick, 800);
-        }
     }
 
     if (doc.readyState === 'loading') {

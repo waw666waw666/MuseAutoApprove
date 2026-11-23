@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-7.0.1-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-7.0.2-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -33,8 +33,8 @@ Automatically detects permission dialogs on Muse (file uploads, tool executions,
 
 ## Key Features
 
-- **Dual-Engine Coordination (Direct RPC + DOM Penetration)**  
-  Extracts Muse's `HatchRpc` context via React Fiber to silently approve `egress.approvals` in-flight, while the DOM penetration engine handles client-only cards (file uploads, public links, etc.) with smart RPC handoff to prevent duplicate triggers.
+- **Protocol-First Dual Engine (Direct RPC Primary + DOM Penetration Fallback)**  
+  Actively polls `egress.approvals` via React Fiber (preferring React 18 `FiberRootNode.current`) immediately on load without waiting for UI cards. DOM penetration serves as secondary fallback only when RPC cannot connect or does not list the prompt. RPC errors surface explicit reasons with exponential backoff instead of failing silently.
 
 - **Strict Tier Priority (Always / All First, Single Fallback)**  
   RPC prioritizes `allow_always` and automatically degrades to `allow_once` when server policy forbids permanent approval. DOM clicking ranks buttons across 5 tiers (`Allow all` / `Always allow all` > `Allow always` / `Always allow` / `Always allow this site` > `Allow all once` > `Allow for this site` / `Allow for this task` > `Allow` / `Approve`) and normalizes badge counts like `Allow all (3)`.

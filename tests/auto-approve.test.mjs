@@ -11,9 +11,9 @@ const MANIFEST = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.m
     const strippedUser = USER_JS.replace(/^\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\s*/, '')
         .replace('免责声明：本脚本', '免责声明：本扩展');
     assert.equal(strippedUser.trim(), CONTENT_JS.trim(), 'muse-auto-approve.user.js 与 content.js 主体必须一致');
-    assert.equal(MANIFEST.version, '7.0.1');
+    assert.equal(MANIFEST.version, '7.0.2');
     assert.equal(MANIFEST.content_scripts[0].world, 'MAIN');
-    assert.match(USER_JS, /@version\s+7\.0\.1/);
+    assert.match(USER_JS, /@version\s+7\.0\.2/);
     assert.match(USER_JS, /@grant\s+none/);
     assert.match(USER_JS, /@run-at\s+document-start/);
     console.log('[PASS] 0. 元数据、双模同步与 manifest.json 校验通过');
@@ -234,6 +234,7 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     const postedMessages = [];
     const topObj = isTop ? null : { postMessage: (d, t) => postedMessages.push({ d, t }) };
 
+    const logs = { log: [], warn: [], error: [] };
     const win = {
         location: { hostname, origin: `https://${hostname}` },
         document,
@@ -269,7 +270,12 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
         clearTimeout: clearTimer,
         setInterval: (fn, d) => addTimer(fn, d, true),
         clearInterval: clearTimer,
-        console: { log() {}, warn() {}, error() {}, table() {} },
+        console: {
+            log: (...a) => logs.log.push(a.join(' ')),
+            warn: (...a) => logs.warn.push(a.join(' ')),
+            error: (...a) => logs.error.push(a.join(' ')),
+            table() {},
+        },
     };
     win.window = win;
     win.self = win;
@@ -279,7 +285,7 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     const ctx = vm.createContext(win);
     const runScript = () => vm.runInContext(USER_JS, ctx);
 
-    return { win, document, body, FakeNode, Element, store, postedMessages, timers, advance, runScript };
+    return { win, document, body, FakeNode, Element, store, postedMessages, timers, logs, advance, runScript };
 }
 
 // 1. 严格域名拦截测试
@@ -662,4 +668,192 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     console.log('[PASS] 7. 多实例代际接管与跨帧 origin 安全校验通过');
 }
 
-console.log('\nALL 7 TEST SUITES PASSED!');
+// 8. 协议优先（v7.0.2 新增）：无任何 DOM 审批卡片时，协议线独立捞单并按 allow_always -> allow_once -> allow 批单，胶囊直显状态与批单时间
+{
+    const env = createEnv();
+    const decisionsById = new Map();
+    let pendingList = [
+        { approval_id: 'upload_1', title: 'file.upload (always)' },
+        { approval_id: 'upload_2', title: 'file.upload (once)' },
+        { approval_id: 'upload_3', title: 'file.upload (allow)' },
+    ];
+
+    // 模拟 React 18 双缓冲陷阱：DOM 上挂的旧 Fiber 里 isReady=false，真正最新的树在 HostRoot.stateNode.current 上！
+    const staleCtx = {
+        gatewayUrl: 'wss://gw.muse.ai',
+        isReady: false,
+        connectionState: 'connecting',
+        ensureLiveConnection: async () => {},
+        sendRequest: async () => { throw new Error('stale ctx should not be used'); },
+    };
+    const liveCtx = {
+        gatewayUrl: 'wss://gw.muse.ai',
+        isReady: true,
+        connectionState: 'connected',
+        connectionAuthority: { targetKey: 'vm-live' },
+        ensureLiveConnection: async () => {},
+        sendRequest: async (method, payload) => {
+            if (method === 'egress.approvals') {
+                return { pending_approvals: pendingList };
+            }
+            if (method === 'egress.approval.decide') {
+                const list = decisionsById.get(payload.approval_id) || [];
+                list.push(payload.decision);
+                decisionsById.set(payload.approval_id, list);
+
+                if (payload.approval_id === 'upload_2' && payload.decision === 'allow_always') {
+                    throw new Error('400 unsupported decision allow_always');
+                }
+                if (payload.approval_id === 'upload_3' && (payload.decision === 'allow_always' || payload.decision === 'allow_once')) {
+                    throw new Error(`400 unsupported decision ${payload.decision}`);
+                }
+                pendingList = pendingList.filter((x) => x.approval_id !== payload.approval_id);
+                return { ok: true };
+            }
+            return { ok: true };
+        },
+    };
+
+    const currentHostRoot = {
+        return: null,
+        dependencies: { firstContext: { memoizedValue: liveCtx, next: null } },
+        child: null,
+        sibling: null,
+    };
+    const staleHostRoot = {
+        return: null,
+        stateNode: { current: currentHostRoot },
+        dependencies: { firstContext: { memoizedValue: staleCtx, next: null } },
+        child: null,
+        sibling: null,
+    };
+
+    const appRoot = env.document.createElement('div');
+    appRoot.setAttribute('id', '__next');
+    appRoot.__reactFiber$mock = staleHostRoot;
+    env.body.appendChild(appRoot);
+
+    // 确认页面里没有任何按钮或审批卡片
+    assert.equal(env.document.querySelectorAll('button').length, 0, '前置条件：页面无任何审批按钮');
+
+    env.runScript();
+    // 启动后主动查单，仅推进 200ms 协议线就应独立捞起并批完全部 3 单
+    await env.advance(200);
+
+    assert.deepEqual(decisionsById.get('upload_1'), ['allow_always'], '无卡单 1 应直接 allow_always');
+    assert.deepEqual(decisionsById.get('upload_2'), ['allow_always', 'allow_once'], '无卡单 2 应降级 allow_once');
+    assert.deepEqual(decisionsById.get('upload_3'), ['allow_always', 'allow_once', 'allow'], '无卡单 3 应降级 allow');
+
+    const d = env.win.__musePerm.diag();
+    assert.equal(d.rpcReady, true);
+    assert.equal(d.rpcStatus, 'connected');
+    assert.equal(d.rpcCount, 3, '无 DOM 卡时协议线必须独立完成 3 单');
+    assert.equal(d.domCount, 0, '无 DOM 卡时 DOM 计数必须为 0');
+    assert.ok(d.lastRpcApprovedAt > 0, '必须记录最近协议批单时间戳');
+    assert.match(d.lastRpcApprovedTime, /^\d{2}:\d{2}:\d{2}$/, '必须格式化最近批单时钟时间');
+
+    // 检查悬浮胶囊直显内容：协议已连 + 时间 + 累计批掉数
+    const badge = env.document.getElementById('muse-aa-badge-v7');
+    assert.ok(badge, '必须存在悬浮胶囊');
+    assert.match(badge.textContent, /协议已连/, '胶囊必须直显「协议已连」');
+    assert.ok(badge.textContent.includes(d.lastRpcApprovedTime), '胶囊必须直显最近协议批单时间');
+    assert.ok(badge.textContent.includes('3'), '胶囊必须直显累计批掉数');
+    assert.match(badge.title, /协议已连接/, '悬停提示必须包含协议状态');
+    console.log('[PASS] 8. 协议优先：无 DOM 卡独立捞单批单（含双缓冲与三级降级）及胶囊状态显示通过');
+}
+
+// 9. 协议失败显式归因 + 退避不刷屏 + DOM 第二引擎按五档词表兜底 + 协议自动恢复
+{
+    const env = createEnv();
+    let rpcMode = 'auth_fail'; // 先模拟 403 没权限失败，再模拟恢复
+    let pollTimestamps = [];
+    let pendingAfterRecover = [{ approval_id: 'after_recover_1', title: 'upload.after.recover' }];
+    const decidedAfterRecover = [];
+
+    const ctx = {
+        gatewayUrl: 'wss://gw.muse.ai',
+        isReady: true,
+        connectionState: 'connected',
+        ensureLiveConnection: async () => {},
+        sendRequest: async (method, payload) => {
+            if (method === 'egress.approvals') {
+                pollTimestamps.push(env.win.Date.now());
+                if (rpcMode === 'auth_fail') {
+                    throw new Error('403 permission denied: egress token expired');
+                }
+                return { pending_approvals: pendingAfterRecover };
+            }
+            if (method === 'egress.approval.decide') {
+                decidedAfterRecover.push(payload);
+                pendingAfterRecover = pendingAfterRecover.filter((x) => x.approval_id !== payload.approval_id);
+                return { ok: true };
+            }
+            return { ok: true };
+        },
+    };
+
+    const appRoot = env.document.createElement('div');
+    appRoot.setAttribute('id', '__next');
+    appRoot.__reactFiber$mock = {
+        return: null,
+        dependencies: { firstContext: { memoizedValue: ctx, next: null } },
+    };
+    env.body.appendChild(appRoot);
+
+    env.runScript();
+    // 推进 25 秒：验证退避拉长 + 显式报错原因 + 不刷屏
+    await env.advance(25_000);
+
+    const dFail = env.win.__musePerm.diag();
+    assert.equal(dFail.rpcReady, false, '接口报错后协议状态必须为未连接');
+    assert.equal(dFail.domFallbackActive, true, '协议失败时 DOM 兜底必须处于激活态');
+    assert.equal(dFail.rpcLastError.category, '没权限', '403 必须准确归类为「没权限」');
+    assert.match(dFail.rpcLastError.raw, /403 permission denied: egress token expired/, '必须保留接口报错原文');
+
+    // 验证退避拉长：25 秒内尝试次数应显著少于 1s 高频轮询（1.5+3+6+12=22.5s -> 约 5 次）
+    assert.ok(pollTimestamps.length >= 3 && pollTimestamps.length <= 7, `退避重试次数应受控，实际=${pollTimestamps.length}`);
+    assert.ok(pollTimestamps[2] - pollTimestamps[1] > pollTimestamps[1] - pollTimestamps[0], '重试间隔必须逐步拉长');
+
+    // 验证显式日志但绝不刷屏
+    const rpcWarns = env.logs.warn.filter((l) => l.includes('协议线异常'));
+    assert.ok(rpcWarns.length >= 1 && rpcWarns.length <= 3, `日志应明确汇报且不刷屏，实际=${rpcWarns.length}`);
+    assert.match(rpcWarns[0], /没权限.*403 permission denied: egress token expired/, '告警必须写明原因与报错原文');
+
+    // 验证悬浮胶囊显式显示「协议未连」且悬停写明原因
+    const badge = env.document.getElementById('muse-aa-badge-v7');
+    assert.match(badge.textContent, /协议未连/, '协议失败时胶囊必须显式「协议未连」');
+    assert.match(badge.title, /403 permission denied: egress token expired/, '胶囊悬停必须写明失败原因');
+
+    // 此时页面出现审批卡片（同时带 Tier2「始终允许此网站」与 Tier5「允许」），DOM 第二引擎必须立刻 0 礼让兜底并按 7.0.1 五档优先点 Tier2！
+    const card = env.document.createElement('div');
+    const denyBtn = env.document.createElement('button');
+    denyBtn.textContent = '拒绝';
+    const singleBtn = env.document.createElement('button');
+    singleBtn.textContent = '允许';
+    const siteAlwaysBtn = env.document.createElement('button');
+    siteAlwaysBtn.textContent = '始终允许此网站';
+    siteAlwaysBtn._onNativeClick = (b) => b.remove();
+    card.appendChild(denyBtn);
+    card.appendChild(singleBtn);
+    card.appendChild(siteAlwaysBtn);
+    env.body.appendChild(card);
+
+    env.win.__musePerm.scanDom();
+    await env.advance(300);
+    assert.equal(siteAlwaysBtn.clickCount, 1, '协议失败时 DOM 第二引擎必须零延迟接管并按五档优先点「始终允许此网站」');
+    assert.equal(singleBtn.clickCount, 0);
+    assert.equal(env.win.__musePerm.diag().domCount, 1);
+
+    // 模拟协议恢复：自动重连恢复「协议已连」，并无卡独立批掉新单！
+    rpcMode = 'ok';
+    await env.advance(32_000);
+    const dRecovered = env.win.__musePerm.diag();
+    assert.equal(dRecovered.rpcReady, true, '协议恢复后必须自动切回已连接');
+    assert.equal(dRecovered.rpcLastError, null, '恢复后错误应清空');
+    assert.equal(decidedAfterRecover.length, 1, '恢复后必须独立捞起并批掉无卡新单');
+    assert.equal(decidedAfterRecover[0].decision, 'allow_always');
+    assert.match(badge.textContent, /协议已连/, '恢复后胶囊应切回「协议已连」');
+    console.log('[PASS] 9. 协议失败显式报错/退避不刷屏 + DOM 第二引擎五档兜底 + 自动恢复通过');
+}
+
+console.log('\nALL 9 TEST SUITES PASSED!');

@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-7.0.1-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-7.0.2-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -33,8 +33,8 @@
 
 ## 核心特性
 
-- **双引擎协同（RPC 静默直通 + DOM 穿透精点）**  
-  自动提取页面 React Fiber 中的 `HatchRpc` 通道，后台直接应答 `egress.approvals` 待审批列表；遇到不走 RPC 的前端弹窗（如文件上传、创建公开链接等），DOM 穿透引擎礼让防撞后自动接管点击，两路无缝互补。
+- **协议优先双引擎（RPC 第一引擎为主 + DOM 穿透第二引擎兜底）**  
+  启动后优先通过 React Fiber（支持 React 18 双缓冲树 `stateNode.current`）提取 `HatchRpc` 通道，主动持续查询 `egress.approvals` 并批单，不依赖页面出卡；仅当协议线连不上或查不到时，DOM 穿透第二引擎才无缝接管兜底。协议失败会显式写明原因（连不上 / 没权限 / 接口报错原文）并拉长间隔自动重试，绝不静默装死。
 
 - **严格档位优先（全部 / 永久允许优先，降级兜底单个允许）**  
   RPC 侧默认先发 `allow_always`（永久允许），遇到服务端限制仅允许单次的项目自动降级为 `allow_once`；页面点击侧支持五级档位排序（`全部允许 / 全部永久允许` > `永久允许 / 始终允许 / 始终允许此网站 / 始终允许此连接器 / Always allow this site` > `全部允许一次` > `此网站内允许 / 此任务内允许 / Allow for this site / Allow for this task` > `允许 / Allow / Approve`），自动剥离按钮角标数字（如 `全部允许 (3)`）。
@@ -55,7 +55,7 @@
   - **按住拖动**：自由放置在屏幕任意位置，自动持久化记忆坐标，页面刷新不丢失。
   - **左键单击**：一键切换“自动运行 / 暂停”状态，并同步子 iframe。
   - **右键单击**：一键清零审批累计计数。
-  - **状态可视**：直观区分“双擎（RPC已连）”与“点控（DOM值守）”，悬停可看直通/点击明细。
+  - **状态可视**：胶囊直接显示「协议已连 / 协议未连」、最近一次协议批单时间与累计批掉数，悬停可看协议状态/报错原因与协议/兜底明细。
 
 ---
 
