@@ -2,7 +2,7 @@
     'use strict';
 
     // 免责声明：本扩展仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.0.2';
+    const VERSION = '7.0.3';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -139,6 +139,8 @@
         domTimer: null,
         domThrottleTimer: null,
         domDeferTimer: null,
+        toastTimer: null,
+        detailHideTimer: null,
         observers: new Set(),
         observedRoots: new WeakSet(),
         destroyed: false,
@@ -146,9 +148,13 @@
 
     const isActiveGen = () => !owned.destroyed && myGen === G.gen;
 
-    // 5. 悬浮胶囊 UI（零高频重排、拖拽记忆、状态直观）
+    // 5. 悬浮胶囊 UI（100% 恢复 v6.4.1 原版迷你胶囊样式 + 悬停详情面板 + 仅出错弹出提示）
     const BADGE_ID = 'muse-aa-badge-v7';
+    const DETAIL_ID = 'muse-aa-detail-v7';
+    const TOAST_ID = 'muse-aa-toast-v7';
     let badgeRefs = null;
+    let detailPanel = null;
+    let toastEl = null;
     let legacyCleaned = false;
 
     const cleanupLegacyBadgesOnce = () => {
@@ -162,14 +168,215 @@
     };
 
     const clampBadgePosition = (badge, left, top) => {
-        const w = badge.offsetWidth || 110;
-        const h = badge.offsetHeight || 26;
+        const w = badge.offsetWidth || 90;
+        const h = badge.offsetHeight || 24;
         const maxLeft = Math.max(4, (win.innerWidth || 1024) - w - 4);
         const maxTop = Math.max(4, (win.innerHeight || 768) - h - 4);
         return {
             left: Math.min(Math.max(4, left), maxLeft),
             top: Math.min(Math.max(4, top), maxTop),
         };
+    };
+
+    const formatClockTime = (ts) => {
+        if (!ts || !Number.isFinite(ts)) return '';
+        const d = new Date(ts);
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    };
+
+    const positionFloatingBelowBadge = (el, widthHint = 230, heightHint = 110) => {
+        if (!el || !badgeRefs || !badgeRefs.el || !badgeRefs.el.isConnected) return;
+        const rect = badgeRefs.el.getBoundingClientRect();
+        const vw = win.innerWidth || 1024;
+        const vh = win.innerHeight || 768;
+        const w = el.offsetWidth || widthHint;
+        const h = el.offsetHeight || heightHint;
+
+        let left = rect.right - w;
+        if (left < 6) left = Math.max(6, rect.left);
+        if (left + w > vw - 6) left = Math.max(6, vw - w - 6);
+
+        let top = rect.bottom + 6;
+        if (top + h > vh - 6) {
+            top = Math.max(6, rect.top - h - 6);
+        }
+        el.style.left = Math.round(left) + 'px';
+        el.style.top = Math.round(top) + 'px';
+        el.style.right = 'auto';
+        el.style.bottom = 'auto';
+    };
+
+    const hideDetailPanel = () => {
+        if (owned.detailHideTimer) {
+            clearTimeout(owned.detailHideTimer);
+            owned.detailHideTimer = null;
+        }
+        if (detailPanel && detailPanel.isConnected) {
+            detailPanel.style.display = 'none';
+        }
+    };
+
+    const scheduleHideDetailPanel = () => {
+        if (owned.detailHideTimer) clearTimeout(owned.detailHideTimer);
+        owned.detailHideTimer = setTimeout(() => {
+            owned.detailHideTimer = null;
+            hideDetailPanel();
+        }, 180);
+    };
+
+    const updateDetailPanelContent = () => {
+        if (!detailPanel || !isTop) return;
+        const on = state.enabled;
+        const rpcOnline = !!G.rpcReady;
+        const lastRpcClock = formatClockTime(state.lastRpcApprovedAt);
+        const lastRpcLine = lastRpcClock
+            ? `${lastRpcClock}${state.lastRpcApprovedLabel ? ' · ' + state.lastRpcApprovedLabel : ''}`
+            : '暂无';
+
+        const rows = [
+            `Muse 自动审批 v${VERSION}（${on ? '运行中' : '已暂停'}）`,
+            `协议状态：${rpcOnline ? '已连接（第一引擎主动查单）' : '未连接（页面兜底中）'}`,
+            `最近协议批单：${lastRpcLine}`,
+            `累计批掉：${state.count} 次（协议 ${state.rpcCount} / 兜底 ${state.domCount}）`,
+            `最近动作：${lastActionSummary}`,
+        ];
+        if (!rpcOnline && G.rpcStatusReason) {
+            rows.push(`失败原因：${G.rpcStatusReason}`);
+        }
+        rows.push('按住拖动 · 左键开关 · 右键清零');
+
+        detailPanel.textContent = '';
+        for (let i = 0; i < rows.length; i++) {
+            const line = doc.createElement('div');
+            line.textContent = rows[i];
+            if (i === 0) {
+                line.style.cssText = 'font-weight:600;color:#ecfdf5;margin-bottom:4px;padding-bottom:4px;border-bottom:1px solid rgba(255,255,255,0.12);';
+            } else if (rows[i].startsWith('失败原因：')) {
+                line.style.cssText = 'color:#fde68a;margin-top:2px;word-break:break-word;';
+            } else if (i === rows.length - 1) {
+                line.style.cssText = 'color:rgba(209,213,219,0.75);font-size:10px;margin-top:5px;padding-top:4px;border-top:1px solid rgba(255,255,255,0.1);';
+            } else {
+                line.style.cssText = 'color:rgba(243,244,246,0.92);margin-top:2px;word-break:break-word;';
+            }
+            detailPanel.appendChild(line);
+        }
+    };
+
+    const showDetailPanel = () => {
+        if (!isTop || !doc.body || !isActiveGen()) return;
+        if (owned.detailHideTimer) {
+            clearTimeout(owned.detailHideTimer);
+            owned.detailHideTimer = null;
+        }
+        if (!detailPanel || !detailPanel.isConnected) {
+            const old = doc.getElementById(DETAIL_ID);
+            if (old) old.remove();
+            detailPanel = doc.createElement('div');
+            detailPanel.id = DETAIL_ID;
+            detailPanel.setAttribute('data-muse-aa-ui', '1');
+            detailPanel.style.cssText = [
+                'position:fixed',
+                'z-index:2147483647',
+                'min-width:210px',
+                'max-width:280px',
+                'padding:8px 10px',
+                'border-radius:10px',
+                'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+                'font-size:11px',
+                'line-height:1.45',
+                'color:#fff',
+                'background:rgba(17,24,39,0.92)',
+                'border:1px solid rgba(167,243,208,0.28)',
+                'box-shadow:0 4px 14px rgba(0,0,0,0.38)',
+                'backdrop-filter:blur(8px)',
+                'user-select:none',
+                'display:none',
+            ].join(';');
+            detailPanel.addEventListener('pointerenter', () => {
+                if (owned.detailHideTimer) {
+                    clearTimeout(owned.detailHideTimer);
+                    owned.detailHideTimer = null;
+                }
+            });
+            detailPanel.addEventListener('pointerleave', scheduleHideDetailPanel);
+            doc.body.appendChild(detailPanel);
+        }
+        updateDetailPanelContent();
+        detailPanel.style.display = 'block';
+        positionFloatingBelowBadge(detailPanel, 240, 128);
+    };
+
+    let toastLastKey = '';
+    let toastLastAt = 0;
+
+    const clearErrorToast = (resetDedupe = false) => {
+        if (owned.toastTimer) {
+            clearTimeout(owned.toastTimer);
+            owned.toastTimer = null;
+        }
+        if (toastEl && toastEl.isConnected) {
+            toastEl.remove();
+        }
+        toastEl = null;
+        if (resetDedupe) {
+            toastLastKey = '';
+            toastLastAt = 0;
+        }
+    };
+
+    // 平时完全安静，只有协议线或兜底线出错时才弹出简短提示，几秒后自动消失（同错 30s 内不重复打扰）
+    const showErrorToast = (lineName, reason, durationMs = 4500) => {
+        if (!isTop || !doc.body || !isActiveGen() || !state.enabled) return;
+        const text = `[${lineName}] ${String(reason || '执行出错')}`;
+        const now = Date.now();
+        if (text === toastLastKey && now - toastLastAt < 30000) return;
+        toastLastKey = text;
+        toastLastAt = now;
+
+        clearErrorToast(false);
+        const old = doc.getElementById(TOAST_ID);
+        if (old) old.remove();
+
+        const el = doc.createElement('div');
+        el.id = TOAST_ID;
+        el.setAttribute('data-muse-aa-ui', '1');
+        el.style.cssText = [
+            'position:fixed',
+            'z-index:2147483647',
+            'max-width:290px',
+            'padding:5px 10px',
+            'border-radius:10px',
+            'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+            'font-size:11px',
+            'font-weight:500',
+            'line-height:1.35',
+            'color:#fef2f2',
+            'background:rgba(127,29,29,0.92)',
+            'border:1px solid rgba(252,165,165,0.38)',
+            'box-shadow:0 2px 10px rgba(0,0,0,0.35)',
+            'backdrop-filter:blur(6px)',
+            'pointer-events:none',
+            'word-break:break-word',
+        ].join(';');
+        el.textContent = text.length > 140 ? text.slice(0, 137) + '...' : text;
+        doc.body.appendChild(el);
+        toastEl = el;
+
+        if (badgeRefs && badgeRefs.el && badgeRefs.el.isConnected) {
+            positionFloatingBelowBadge(el, 240, 42);
+        } else {
+            el.style.top = '48px';
+            el.style.right = '16px';
+        }
+
+        owned.toastTimer = setTimeout(() => {
+            owned.toastTimer = null;
+            if (toastEl === el && el.isConnected) {
+                el.remove();
+                toastEl = null;
+            }
+        }, durationMs);
     };
 
     const ensureBadge = () => {
@@ -183,6 +390,7 @@
         let badge = doc.getElementById(BADGE_ID);
         if (badge) badge.remove();
 
+        // 严格复刻 v6.4.1 (ef67355) 原版迷你胶囊样式：尺寸、圆角、内边距、字号、不折行
         badge = doc.createElement('div');
         badge.id = BADGE_ID;
         badge.setAttribute('data-muse-aa-ui', '1');
@@ -192,19 +400,20 @@
             'display:inline-flex',
             'align-items:center',
             'gap:5px',
-            'padding:4px 10px',
+            'padding:3px 9px',
             'border-radius:999px',
             'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
             'font-size:11px',
             'font-weight:600',
             'line-height:1.2',
+            'white-space:nowrap',
             'color:#fff',
             'cursor:grab',
             'user-select:none',
-            'box-shadow:0 2px 10px rgba(0,0,0,0.35)',
-            'backdrop-filter:blur(8px)',
-            'transition:background 0.2s ease,opacity 0.2s ease,transform 0.15s ease',
-            'opacity:0.92',
+            'box-shadow:0 2px 8px rgba(0,0,0,0.35)',
+            'backdrop-filter:blur(6px)',
+            'transition:background 0.2s ease,opacity 0.2s ease',
+            'opacity:0.9',
         ].join(';');
 
         if (state.pos && typeof state.pos.left === 'number' && typeof state.pos.top === 'number') {
@@ -220,24 +429,27 @@
         dotEl.style.cssText = 'width:6px;height:6px;border-radius:50%;flex-shrink:0;';
 
         const labelEl = doc.createElement('span');
-        const engineEl = doc.createElement('span');
-        engineEl.style.cssText = 'font-size:10px;opacity:0.86;font-weight:500;';
 
         const countEl = doc.createElement('span');
-        countEl.style.cssText = 'background:rgba(0,0,0,0.24);padding:1px 6px;border-radius:999px;font-size:10px;font-variant-numeric:tabular-nums;';
+        countEl.style.cssText = 'background:rgba(0,0,0,0.22);padding:1px 5px;border-radius:999px;font-size:10px;';
 
         badge.appendChild(dotEl);
         badge.appendChild(labelEl);
-        badge.appendChild(engineEl);
         badge.appendChild(countEl);
 
-        // 拖拽与左键开关 / 右键清零
+        // 拖拽与左键开关 / 右键清零 / 悬停展开详情
         let isDragging = false;
         let hasMoved = false;
         let startX = 0, startY = 0, initLeft = 0, initTop = 0;
 
+        badge.addEventListener('pointerenter', () => {
+            if (!isDragging) showDetailPanel();
+        });
+        badge.addEventListener('pointerleave', scheduleHideDetailPanel);
+
         badge.addEventListener('pointerdown', (e) => {
             if (e.button !== 0) return;
+            hideDetailPanel();
             isDragging = true;
             hasMoved = false;
             startX = e.clientX;
@@ -296,18 +508,11 @@
         });
 
         doc.body.appendChild(badge);
-        badgeRefs = { el: badge, dotEl, labelEl, engineEl, countEl };
+        badgeRefs = { el: badge, dotEl, labelEl, countEl };
         return badgeRefs;
     };
 
-    const formatClockTime = (ts) => {
-        if (!ts || !Number.isFinite(ts)) return '';
-        const d = new Date(ts);
-        const pad = (n) => String(n).padStart(2, '0');
-        return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-    };
-
-    const renderBadge = (pulse = false) => {
+    const renderBadge = () => {
         if (!isTop || !doc.body || !isActiveGen()) return;
         const refs = ensureBadge();
         if (!refs) return;
@@ -316,20 +521,19 @@
         const rpcOnline = !!G.rpcReady;
         const lastRpcClock = formatClockTime(state.lastRpcApprovedAt);
 
+        // 原版配色（绿 / 灰），小圆点在原版尺寸内指示协议状态（薄荷绿=协议已连，柔琥珀=协议未连兜底中，灰=暂停）
         refs.el.style.background = on
-            ? (rpcOnline
-                ? 'linear-gradient(135deg, rgba(16,185,129,0.94), rgba(5,150,105,0.94))'
-                : 'linear-gradient(135deg, rgba(217,119,6,0.92), rgba(180,83,9,0.92))')
-            : 'linear-gradient(135deg, rgba(75,85,99,0.92), rgba(55,65,81,0.92))';
+            ? 'linear-gradient(135deg, rgba(16,185,129,0.92), rgba(5,150,105,0.92))'
+            : 'linear-gradient(135deg, rgba(75,85,99,0.9), rgba(55,65,81,0.9))';
         refs.el.style.border = on
-            ? (rpcOnline ? '1px solid rgba(167,243,208,0.42)' : '1px solid rgba(253,230,138,0.42)')
-            : '1px solid rgba(156,163,175,0.28)';
+            ? '1px solid rgba(167, 243, 208, 0.35)'
+            : '1px solid rgba(156, 163, 175, 0.25)';
 
         refs.dotEl.style.background = on ? (rpcOnline ? '#a7f3d0' : '#fde68a') : '#9ca3af';
-        refs.dotEl.style.boxShadow = on ? (rpcOnline ? '0 0 5px #a7f3d0' : '0 0 5px #fde68a') : 'none';
-        refs.labelEl.textContent = on ? (rpcOnline ? '协议已连' : '协议未连') : '已暂停';
-        refs.engineEl.textContent = on ? (lastRpcClock || (rpcOnline ? '待批' : '兜底中')) : '';
-        refs.engineEl.style.display = on ? 'inline' : 'none';
+        refs.dotEl.style.boxShadow = on
+            ? (rpcOnline ? '0 0 4px #a7f3d0' : '0 0 4px #fde68a')
+            : 'none';
+        refs.labelEl.textContent = on ? '自动' : '暂停';
         refs.countEl.textContent = String(state.count);
 
         const rpcStateLine = rpcOnline
@@ -348,11 +552,8 @@
             '操作：按住拖动 | 左键开关 | 右键清零',
         ].join('\n');
 
-        if (pulse) {
-            refs.el.style.transform = 'scale(1.08)';
-            setTimeout(() => {
-                if (refs.el && refs.el.isConnected) refs.el.style.transform = '';
-            }, 180);
+        if (detailPanel && detailPanel.isConnected && detailPanel.style.display !== 'none') {
+            updateDetailPanelContent();
         }
     };
 
@@ -370,7 +571,7 @@
             }
             lastActionSummary = summary;
             saveState();
-            renderBadge(true);
+            renderBadge();
         } else {
             try {
                 win.top.postMessage({
@@ -802,6 +1003,7 @@
                 TAG,
                 `⚠ [协议线异常 #${rpcSameErrCount}] ${reason}（${retrySec}s 后自动重试，期间 DOM 第二引擎兜底）`
             );
+            showErrorToast('协议线', reason);
         }
         renderBadge();
     }
@@ -813,6 +1015,7 @@
         rpcSameErrCount = 0;
         G.rpcLastError = null;
         G.rpcStatusReason = '已连接';
+        clearErrorToast(true);
         if (!G.rpcReady) {
             G.rpcReady = true;
             renderBadge();
@@ -1408,6 +1611,7 @@
                 G.domLog.push({ text: rawText, tier, clue, ok: false, fails, at: Date.now() });
                 if (G.domLog.length > 200) G.domLog.shift();
                 console.warn(TAG, `⚠ [页面精点未生效#${fails}]「${rawText}」，不计入通过数，稍后升级重试`);
+                showErrorToast('兜底线', `点击「${rawText}」未生效，稍后自动重试`);
             }
         };
 
@@ -1676,6 +1880,10 @@
         if (owned.domTimer) { clearInterval(owned.domTimer); owned.domTimer = null; }
         if (owned.domThrottleTimer) { clearTimeout(owned.domThrottleTimer); owned.domThrottleTimer = null; }
         if (owned.domDeferTimer) { clearTimeout(owned.domDeferTimer); owned.domDeferTimer = null; }
+        clearErrorToast();
+        hideDetailPanel();
+        if (detailPanel && detailPanel.isConnected) detailPanel.remove();
+        detailPanel = null;
         for (const obs of owned.observers) {
             try { obs.disconnect(); } catch (e) {}
         }

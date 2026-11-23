@@ -11,9 +11,9 @@ const MANIFEST = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.m
     const strippedUser = USER_JS.replace(/^\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\s*/, '')
         .replace('免责声明：本脚本', '免责声明：本扩展');
     assert.equal(strippedUser.trim(), CONTENT_JS.trim(), 'muse-auto-approve.user.js 与 content.js 主体必须一致');
-    assert.equal(MANIFEST.version, '7.0.2');
+    assert.equal(MANIFEST.version, '7.0.3');
     assert.equal(MANIFEST.content_scripts[0].world, 'MAIN');
-    assert.match(USER_JS, /@version\s+7\.0\.2/);
+    assert.match(USER_JS, /@version\s+7\.0\.3/);
     assert.match(USER_JS, /@grant\s+none/);
     assert.match(USER_JS, /@run-at\s+document-start/);
     console.log('[PASS] 0. 元数据、双模同步与 manifest.json 校验通过');
@@ -752,14 +752,27 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     assert.ok(d.lastRpcApprovedAt > 0, '必须记录最近协议批单时间戳');
     assert.match(d.lastRpcApprovedTime, /^\d{2}:\d{2}:\d{2}$/, '必须格式化最近批单时钟时间');
 
-    // 检查悬浮胶囊直显内容：协议已连 + 时间 + 累计批掉数
+    // 检查悬浮胶囊：收起态 100% 原版迷你样式（小圆点 + 自动 + 数字），绝不撑大，平时安静不弹错，悬停展开详情含协议状态与批单时间
     const badge = env.document.getElementById('muse-aa-badge-v7');
     assert.ok(badge, '必须存在悬浮胶囊');
-    assert.match(badge.textContent, /协议已连/, '胶囊必须直显「协议已连」');
-    assert.ok(badge.textContent.includes(d.lastRpcApprovedTime), '胶囊必须直显最近协议批单时间');
-    assert.ok(badge.textContent.includes('3'), '胶囊必须直显累计批掉数');
+    assert.match(badge.style.cssText, /padding:3px 9px/, '胶囊内边距必须与 v6.4.1 原版一致');
+    assert.match(badge.style.cssText, /font-size:11px/, '胶囊字号必须与 v6.4.1 原版一致');
+    assert.match(badge.style.cssText, /white-space:nowrap/, '胶囊必须不折行');
+    assert.equal(badge.children.length, 3, '原版收起态仅 3 个子元素（圆点、自动/暂停、数字）');
+    assert.equal(badge.children[0].style.background, '#a7f3d0', '协议已连时小圆点为原版薄荷绿');
+    assert.equal(badge.textContent, '自动3', '收起态仅显示原版「自动 + 数字」，不得塞长文字撑大胶囊');
+    assert.equal(env.document.getElementById('muse-aa-toast-v7'), null, '正常批单时必须安静，绝不弹提示');
     assert.match(badge.title, /协议已连接/, '悬停提示必须包含协议状态');
-    console.log('[PASS] 8. 协议优先：无 DOM 卡独立捞单批单（含双缓冲与三级降级）及胶囊状态显示通过');
+    assert.ok(badge.title.includes(d.lastRpcApprovedTime), '悬停提示必须包含最近协议批单时间');
+
+    // 模拟悬停展开详情面板，检查完整 7.0.2 状态内容
+    badge.dispatchEvent(new env.win.PointerEvent('pointerenter', {}));
+    const detail = env.document.getElementById('muse-aa-detail-v7');
+    assert.ok(detail && detail.style.display === 'block', '悬停胶囊必须展开详情面板');
+    assert.match(detail.textContent, /协议状态：已连接/, '详情面板必须显示协议已连接');
+    assert.ok(detail.textContent.includes(d.lastRpcApprovedTime), '详情面板必须显示最近协议批单时间');
+    assert.match(detail.textContent, /累计批掉：3 次（协议 3 \/ 兜底 0）/, '详情面板必须显示协议与兜底明细');
+    console.log('[PASS] 8. 协议优先：无 DOM 卡独立捞单批单、原版迷你胶囊与悬停详情通过');
 }
 
 // 9. 协议失败显式归因 + 退避不刷屏 + DOM 第二引擎按五档词表兜底 + 协议自动恢复
@@ -801,8 +814,18 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     env.body.appendChild(appRoot);
 
     env.runScript();
-    // 推进 25 秒：验证退避拉长 + 显式报错原因 + 不刷屏
-    await env.advance(25_000);
+    // 推进 200ms：首次协议 403 报错应立刻弹出错误提示，写明「协议线」与报错原文
+    await env.advance(200);
+    const toastOnErr = env.document.getElementById('muse-aa-toast-v7');
+    assert.ok(toastOnErr, '协议线报错时必须弹出错误提示');
+    assert.match(toastOnErr.textContent, /\[协议线\].*没权限.*403 permission denied: egress token expired/, '错误提示必须写明哪条线与原因');
+
+    // 推进 4.6 秒后自动消失
+    await env.advance(4600);
+    assert.equal(env.document.getElementById('muse-aa-toast-v7'), null, '错误提示必须在几秒后自动消失');
+
+    // 继续推进到总计 25 秒：验证退避拉长 + 显式报错原因 + 不刷屏
+    await env.advance(20_200);
 
     const dFail = env.win.__musePerm.diag();
     assert.equal(dFail.rpcReady, false, '接口报错后协议状态必须为未连接');
@@ -819,10 +842,17 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     assert.ok(rpcWarns.length >= 1 && rpcWarns.length <= 3, `日志应明确汇报且不刷屏，实际=${rpcWarns.length}`);
     assert.match(rpcWarns[0], /没权限.*403 permission denied: egress token expired/, '告警必须写明原因与报错原文');
 
-    // 验证悬浮胶囊显式显示「协议未连」且悬停写明原因
+    // 验证原版胶囊：收起态依然小巧（只含「自动 + 数字」），小圆点变柔琥珀色指示未连，悬停写明失败原因
     const badge = env.document.getElementById('muse-aa-badge-v7');
-    assert.match(badge.textContent, /协议未连/, '协议失败时胶囊必须显式「协议未连」');
+    assert.equal(badge.textContent, '自动0', '协议未连时收起态仍保持原版迷你大小不撑大');
+    assert.equal(badge.children[0].style.background, '#fde68a', '协议未连时小圆点切换为琥珀指示');
     assert.match(badge.title, /403 permission denied: egress token expired/, '胶囊悬停必须写明失败原因');
+
+    // 悬停详情面板同样展示未连接状态与具体失败原因
+    badge.dispatchEvent(new env.win.PointerEvent('pointerenter', {}));
+    const detailFail = env.document.getElementById('muse-aa-detail-v7');
+    assert.match(detailFail.textContent, /协议状态：未连接/, '详情面板必须显示未连接');
+    assert.match(detailFail.textContent, /403 permission denied: egress token expired/, '详情面板必须显示报错原因');
 
     // 此时页面出现审批卡片（同时带 Tier2「始终允许此网站」与 Tier5「允许」），DOM 第二引擎必须立刻 0 礼让兜底并按 7.0.1 五档优先点 Tier2！
     const card = env.document.createElement('div');
@@ -844,7 +874,7 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     assert.equal(singleBtn.clickCount, 0);
     assert.equal(env.win.__musePerm.diag().domCount, 1);
 
-    // 模拟协议恢复：自动重连恢复「协议已连」，并无卡独立批掉新单！
+    // 模拟协议恢复：自动重连恢复小圆点为薄荷绿，并无卡独立批掉新单！
     rpcMode = 'ok';
     await env.advance(32_000);
     const dRecovered = env.win.__musePerm.diag();
@@ -852,8 +882,9 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     assert.equal(dRecovered.rpcLastError, null, '恢复后错误应清空');
     assert.equal(decidedAfterRecover.length, 1, '恢复后必须独立捞起并批掉无卡新单');
     assert.equal(decidedAfterRecover[0].decision, 'allow_always');
-    assert.match(badge.textContent, /协议已连/, '恢复后胶囊应切回「协议已连」');
-    console.log('[PASS] 9. 协议失败显式报错/退避不刷屏 + DOM 第二引擎五档兜底 + 自动恢复通过');
+    assert.equal(badge.children[0].style.background, '#a7f3d0', '恢复后小圆点切回原版薄荷绿');
+    assert.equal(badge.textContent, '自动2', '恢复后胶囊保持原版迷你样式并准确显示累计 2 次');
+    console.log('[PASS] 9. 协议失败显式报错/弹窗自动消失 + DOM 五档兜底 + 自动恢复通过');
 }
 
 console.log('\nALL 9 TEST SUITES PASSED!');

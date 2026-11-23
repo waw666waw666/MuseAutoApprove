@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-7.0.2-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-7.0.3-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -55,7 +55,7 @@
   - **按住拖动**：自由放置在屏幕任意位置，自动持久化记忆坐标，页面刷新不丢失。
   - **左键单击**：一键切换“自动运行 / 暂停”状态，并同步子 iframe。
   - **右键单击**：一键清零审批累计计数。
-  - **状态可视**：胶囊直接显示「协议已连 / 协议未连」、最近一次协议批单时间与累计批掉数，悬停可看协议状态/报错原因与协议/兜底明细。
+  - **原版极简外观**：收起态保持迷你胶囊（仅显示小圆点、`自动/暂停` 与累计数字，小圆点轻柔指示协议状态），平时安静不弹窗；鼠标悬停展开详情面板查看协议状态、最近批单时间与明细；仅在协议或兜底出错时短暂弹出错误提示并自动消失。
 
 ---
 
