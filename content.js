@@ -2,262 +2,1574 @@
     'use strict';
 
     // 免责声明：本扩展仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
+    const VERSION = '7.0.0';
+    const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-    const isTop = (win.self === win.top);
+    const doc = win.document || document;
 
-    // 域名硬拦截：无论主窗口还是任何子 iframe，只要不是 muse.ai 站点，一律绝不执行任何操作、绝不篡改任何原型链
-    if (!win.location.hostname.includes('muse.ai')) {
+    // 1. 严格域名拦截：仅允许 muse.ai 及其子域名，绝不误伤任何第三方站点
+    const hostname = (win.location && win.location.hostname ? win.location.hostname : '').toLowerCase();
+    if (hostname !== 'muse.ai' && !hostname.endsWith('.muse.ai')) {
         return;
     }
 
-    // 1. 强行破解 Closed Shadow DOM
-    const shadowRoots = new Set();
-    const origAttachShadow = Element.prototype.attachShadow;
-    Element.prototype.attachShadow = function (init) {
-        const root = origAttachShadow.call(this, { ...init, mode: 'open' });
-        shadowRoots.add(root);
-        return root;
-    };
+    const isTop = (() => {
+        try { return win.self === win.top; } catch (e) { return false; }
+    })();
 
-    const STORAGE_KEY_ENABLED = 'muse_tm_enabled_v63';
-    const STORAGE_KEY_COUNT = 'muse_tm_count_v63';
-    const STORAGE_KEY_POS = 'muse_tm_pos_v63';
-
-    let isEnabled = true;
-    let approveCount = 0;
-    let savedPos = null;
-
-    try {
-        if (localStorage.getItem(STORAGE_KEY_ENABLED) === 'false') isEnabled = false;
-        approveCount = parseInt(localStorage.getItem(STORAGE_KEY_COUNT) || '0', 10) || 0;
-        const posStr = localStorage.getItem(STORAGE_KEY_POS);
-        if (posStr) savedPos = JSON.parse(posStr);
-    } catch (e) {}
-
-    // 子窗口通知顶层窗口更新计数
-    win.addEventListener('message', (e) => {
-        if (e.data === 'MUSE_TM_CLICKED' && isTop) {
-            approveCount++;
-            try { localStorage.setItem(STORAGE_KEY_COUNT, String(approveCount)); } catch (err) {}
-            updateBadge();
-        }
+    // 2. 全局跨实例共享状态与代际号（防止重复注入或热重载导致并发重批）
+    const G = (win.__museAutoApproveGlobal = win.__museAutoApproveGlobal || {
+        gen: 0,
+        activeTeardown: null,
+        shadowRefs: new Set(),
+        onShadowAttached: null,
+        // RPC 共享状态
+        ctx: null,
+        scanAt: 0,
+        scanRes: null,
+        rpcReady: false,
+        inFlight: new Set(),       // 正在请求审批的 approval_id（发请求前占坑防重）
+        seen: new Map(),           // 已批准的 approval_id -> timestamp
+        failState: new Map(),      // approval_id -> { count, nextTryAt }
+        lastRpcApproveAt: 0,
+        rpcLog: [],
+        domLog: [],
+        bannerShown: false,
     });
 
-    // 2. 右上角迷你可拖拽悬浮窗（只在主页面显示）
-    const updateBadge = () => {
-        if (!isTop || !document.body) return;
+    // 若旧实例仍在运行，优雅清理旧实例自己的句柄（不破坏新实例）
+    if (typeof G.activeTeardown === 'function') {
+        try { G.activeTeardown(); } catch (e) {}
+    }
+    const myGen = ++G.gen;
 
-        document.querySelectorAll('div').forEach(el => {
-            if (el.id !== 'muse-tm-badge-v63' && el.children.length <= 4) {
-                const t = (el.textContent || '').trim();
-                if (t.startsWith('自动审批:') || el.id.startsWith('muse-tm-badge')) el.remove();
+    // 3. 极早劫持 Closed Shadow DOM（降级为 open，且用 WeakRef 防内存泄漏）
+    const elemProto = win.Element && win.Element.prototype;
+    if (elemProto && typeof elemProto.attachShadow === 'function' && !elemProto.attachShadow.__museAAHooked) {
+        const origAttachShadow = elemProto.attachShadow;
+        const patchedAttachShadow = function (init) {
+            const nextInit = (init && typeof init === 'object') ? { ...init, mode: 'open' } : { mode: 'open' };
+            const root = origAttachShadow.call(this, nextInit);
+            try {
+                G.shadowRefs.add(typeof WeakRef !== 'undefined' ? new WeakRef(root) : root);
+                if (typeof G.onShadowAttached === 'function') G.onShadowAttached(root);
+            } catch (e) {}
+            return root;
+        };
+        patchedAttachShadow.__museAAHooked = true;
+        elemProto.attachShadow = patchedAttachShadow;
+    }
+
+    // 4. 配置持久化与 v6.3/v6.4 旧版平滑迁移
+    const STORAGE_KEY = 'muse_auto_approve_v7';
+    const LEGACY_KEYS = {
+        enabled: 'muse_tm_enabled_v63',
+        count: 'muse_tm_count_v63',
+        pos: 'muse_tm_pos_v63',
+        rpcCfg: 'musePermCfg',
+    };
+
+    const loadState = () => {
+        const defaults = {
+            enabled: true,
+            count: 0,
+            rpcCount: 0,
+            domCount: 0,
+            pos: null,
+            decision: 'allow_always',
+            rpcIntervalMs: 1800,
+            domIntervalMs: 1200,
+        };
+        try {
+            const raw = win.localStorage.getItem(STORAGE_KEY);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed && typeof parsed === 'object') {
+                    return { ...defaults, ...parsed };
+                }
+            }
+            // 平滑迁移旧版状态、计数与胶囊位置
+            const oldEnabled = win.localStorage.getItem(LEGACY_KEYS.enabled);
+            if (oldEnabled === 'false') defaults.enabled = false;
+            const oldCount = parseInt(win.localStorage.getItem(LEGACY_KEYS.count) || '0', 10);
+            if (Number.isFinite(oldCount) && oldCount > 0) defaults.count = oldCount;
+            const oldPos = win.localStorage.getItem(LEGACY_KEYS.pos);
+            if (oldPos) {
+                const p = JSON.parse(oldPos);
+                if (p && typeof p.left === 'number' && typeof p.top === 'number') defaults.pos = p;
+            }
+            const oldRpc = win.localStorage.getItem(LEGACY_KEYS.rpcCfg);
+            if (oldRpc) {
+                const rc = JSON.parse(oldRpc);
+                if (rc && typeof rc.autoStartDecision === 'string') defaults.decision = rc.autoStartDecision;
+            }
+            win.localStorage.setItem(STORAGE_KEY, JSON.stringify(defaults));
+        } catch (e) {}
+        return defaults;
+    };
+
+    const state = loadState();
+    let lastActionSummary = '待命中，自动监控审批';
+
+    const saveState = () => {
+        try {
+            win.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        } catch (e) {}
+    };
+
+    const isAllowedOrigin = (origin) => {
+        if (!origin || origin === 'null') return false;
+        if (origin === win.location.origin) return true;
+        try {
+            const h = new URL(origin).hostname.toLowerCase();
+            return h === 'muse.ai' || h.endsWith('.muse.ai');
+        } catch (e) {
+            return false;
+        }
+    };
+
+    // 本实例持有的全部句柄（退出时只清理自己，绝不误杀新实例）
+    const owned = {
+        rpcTimer: null,
+        rpcWakeTimer: null,
+        domTimer: null,
+        domThrottleTimer: null,
+        domDeferTimer: null,
+        observers: new Set(),
+        observedRoots: new WeakSet(),
+        destroyed: false,
+    };
+
+    const isActiveGen = () => !owned.destroyed && myGen === G.gen;
+
+    // 5. 悬浮胶囊 UI（零高频重排、拖拽记忆、状态直观）
+    const BADGE_ID = 'muse-aa-badge-v7';
+    let badgeRefs = null;
+    let legacyCleaned = false;
+
+    const cleanupLegacyBadgesOnce = () => {
+        if (legacyCleaned || !isTop || !doc.body) return;
+        legacyCleaned = true;
+        const legacyIds = ['muse-tm-badge-v63', 'muse-tm-badge-v6', '__muse_auto_approve_ball__'];
+        for (const id of legacyIds) {
+            const old = doc.getElementById(id);
+            if (old) old.remove();
+        }
+    };
+
+    const clampBadgePosition = (badge, left, top) => {
+        const w = badge.offsetWidth || 110;
+        const h = badge.offsetHeight || 26;
+        const maxLeft = Math.max(4, (win.innerWidth || 1024) - w - 4);
+        const maxTop = Math.max(4, (win.innerHeight || 768) - h - 4);
+        return {
+            left: Math.min(Math.max(4, left), maxLeft),
+            top: Math.min(Math.max(4, top), maxTop),
+        };
+    };
+
+    const ensureBadge = () => {
+        if (!isTop || !doc.body || !isActiveGen()) return null;
+        cleanupLegacyBadgesOnce();
+
+        if (badgeRefs && badgeRefs.el && badgeRefs.el.isConnected) {
+            return badgeRefs;
+        }
+
+        let badge = doc.getElementById(BADGE_ID);
+        if (badge) badge.remove();
+
+        badge = doc.createElement('div');
+        badge.id = BADGE_ID;
+        badge.setAttribute('data-muse-aa-ui', '1');
+        badge.style.cssText = [
+            'position:fixed',
+            'z-index:2147483647',
+            'display:inline-flex',
+            'align-items:center',
+            'gap:5px',
+            'padding:4px 10px',
+            'border-radius:999px',
+            'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+            'font-size:11px',
+            'font-weight:600',
+            'line-height:1.2',
+            'color:#fff',
+            'cursor:grab',
+            'user-select:none',
+            'box-shadow:0 2px 10px rgba(0,0,0,0.35)',
+            'backdrop-filter:blur(8px)',
+            'transition:background 0.2s ease,opacity 0.2s ease,transform 0.15s ease',
+            'opacity:0.92',
+        ].join(';');
+
+        if (state.pos && typeof state.pos.left === 'number' && typeof state.pos.top === 'number') {
+            const p = clampBadgePosition(badge, state.pos.left, state.pos.top);
+            badge.style.left = p.left + 'px';
+            badge.style.top = p.top + 'px';
+        } else {
+            badge.style.top = '16px';
+            badge.style.right = '16px';
+        }
+
+        const dotEl = doc.createElement('span');
+        dotEl.style.cssText = 'width:6px;height:6px;border-radius:50%;flex-shrink:0;';
+
+        const labelEl = doc.createElement('span');
+        const engineEl = doc.createElement('span');
+        engineEl.style.cssText = 'font-size:10px;opacity:0.86;font-weight:500;';
+
+        const countEl = doc.createElement('span');
+        countEl.style.cssText = 'background:rgba(0,0,0,0.24);padding:1px 6px;border-radius:999px;font-size:10px;font-variant-numeric:tabular-nums;';
+
+        badge.appendChild(dotEl);
+        badge.appendChild(labelEl);
+        badge.appendChild(engineEl);
+        badge.appendChild(countEl);
+
+        // 拖拽与左键开关 / 右键清零
+        let isDragging = false;
+        let hasMoved = false;
+        let startX = 0, startY = 0, initLeft = 0, initTop = 0;
+
+        badge.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0) return;
+            isDragging = true;
+            hasMoved = false;
+            startX = e.clientX;
+            startY = e.clientY;
+            const rect = badge.getBoundingClientRect();
+            initLeft = rect.left;
+            initTop = rect.top;
+            badge.style.cursor = 'grabbing';
+            try { badge.setPointerCapture(e.pointerId); } catch (err) {}
+        });
+
+        badge.addEventListener('pointermove', (e) => {
+            if (!isDragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) hasMoved = true;
+            if (hasMoved) {
+                const p = clampBadgePosition(badge, initLeft + dx, initTop + dy);
+                badge.style.right = 'auto';
+                badge.style.bottom = 'auto';
+                badge.style.left = p.left + 'px';
+                badge.style.top = p.top + 'px';
             }
         });
 
-        let badge = document.getElementById('muse-tm-badge-v63');
-        if (!badge) {
-            badge = document.createElement('div');
-            badge.id = 'muse-tm-badge-v63';
-            badge.title = '按住拖动位置 | 左键：开启/暂停 | 右键：清零计数';
-            badge.style.cssText = `
-                position: fixed; z-index: 2147483647;
-                display: inline-flex; align-items: center; gap: 5px;
-                padding: 3px 9px; border-radius: 999px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                font-size: 11px; font-weight: 600; line-height: 1.2;
-                color: #fff; cursor: grab; user-select: none;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.35); backdrop-filter: blur(6px);
-                transition: background 0.2s ease, opacity 0.2s ease; opacity: 0.9;
-            `;
-
-            if (savedPos && typeof savedPos.left === 'number' && typeof savedPos.top === 'number') {
-                const maxLeft = Math.max(10, window.innerWidth - 90);
-                const maxTop = Math.max(10, window.innerHeight - 35);
-                badge.style.left = Math.min(Math.max(4, savedPos.left), maxLeft) + 'px';
-                badge.style.top = Math.min(Math.max(4, savedPos.top), maxTop) + 'px';
-            } else {
-                badge.style.top = '16px';
-                badge.style.right = '16px';
-            }
-
-            let isDragging = false;
-            let hasMoved = false;
-            let startX = 0, startY = 0, initialLeft = 0, initialTop = 0;
-
-            badge.addEventListener('pointerdown', (e) => {
-                if (e.button !== 0) return;
-                isDragging = true;
-                hasMoved = false;
-                startX = e.clientX;
-                startY = e.clientY;
+        const endDrag = (e) => {
+            if (!isDragging) return;
+            isDragging = false;
+            badge.style.cursor = 'grab';
+            try { badge.releasePointerCapture(e.pointerId); } catch (err) {}
+            if (hasMoved) {
                 const rect = badge.getBoundingClientRect();
-                initialLeft = rect.left;
-                initialTop = rect.top;
-                badge.style.cursor = 'grabbing';
-                badge.setPointerCapture(e.pointerId);
-            });
+                state.pos = { left: Math.round(rect.left), top: Math.round(rect.top) };
+                saveState();
+            } else {
+                setEnabled(!state.enabled);
+            }
+        };
 
-            badge.addEventListener('pointermove', (e) => {
-                if (!isDragging) return;
-                const dx = e.clientX - startX;
-                const dy = e.clientY - startY;
-                if (Math.abs(dx) > 3 || Math.abs(dy) > 3) hasMoved = true;
-                if (hasMoved) {
-                    const newLeft = Math.min(Math.max(4, initialLeft + dx), window.innerWidth - badge.offsetWidth - 4);
-                    const newTop = Math.min(Math.max(4, initialTop + dy), window.innerHeight - badge.offsetHeight - 4);
-                    badge.style.right = 'auto';
-                    badge.style.bottom = 'auto';
-                    badge.style.left = newLeft + 'px';
-                    badge.style.top = newTop + 'px';
-                }
-            });
+        badge.addEventListener('pointerup', endDrag);
+        badge.addEventListener('pointercancel', () => {
+            isDragging = false;
+            badge.style.cursor = 'grab';
+        });
 
-            badge.addEventListener('pointerup', (e) => {
-                if (!isDragging) return;
-                isDragging = false;
-                badge.style.cursor = 'grab';
-                badge.releasePointerCapture(e.pointerId);
+        badge.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            state.count = 0;
+            state.rpcCount = 0;
+            state.domCount = 0;
+            lastActionSummary = '计数已清零';
+            saveState();
+            renderBadge();
+        });
 
-                if (hasMoved) {
-                    const rect = badge.getBoundingClientRect();
-                    savedPos = { left: rect.left, top: rect.top };
-                    try { localStorage.setItem(STORAGE_KEY_POS, JSON.stringify(savedPos)); } catch (err) {}
-                } else {
-                    isEnabled = !isEnabled;
-                    try { localStorage.setItem(STORAGE_KEY_ENABLED, String(isEnabled)); } catch (err) {}
-                    updateBadge();
-                }
-            });
-
-            badge.addEventListener('contextmenu', (e) => {
-                e.preventDefault();
-                approveCount = 0;
-                try { localStorage.setItem(STORAGE_KEY_COUNT, '0'); } catch (err) {}
-                updateBadge();
-            });
-
-            document.body.appendChild(badge);
-        }
-
-        badge.style.background = isEnabled
-            ? 'linear-gradient(135deg, rgba(16,185,129,0.92), rgba(5,150,105,0.92))'
-            : 'linear-gradient(135deg, rgba(75,85,99,0.9), rgba(55,65,81,0.9))';
-        badge.style.border = isEnabled ? '1px solid rgba(167, 243, 208, 0.35)' : '1px solid rgba(156, 163, 175, 0.25)';
-        badge.innerHTML = `
-            <span style="width:6px;height:6px;border-radius:50%;background:${isEnabled ? '#a7f3d0' : '#9ca3af'};${isEnabled ? 'box-shadow:0 0 4px #a7f3d0;' : ''}"></span>
-            <span>${isEnabled ? '自动' : '暂停'}</span>
-            <span style="background:rgba(0,0,0,0.22);padding:1px 5px;border-radius:999px;font-size:10px;">${approveCount}</span>
-        `;
+        doc.body.appendChild(badge);
+        badgeRefs = { el: badge, dotEl, labelEl, engineEl, countEl };
+        return badgeRefs;
     };
 
-    // 3. 深度搜寻页面 + 所有 ShadowDOM + 所有同源 iframe
-    const getAllElementsDeep = (root = document) => {
-        const list = [];
-        const walk = (nodeRoot) => {
-            if (!nodeRoot) return;
-            const all = nodeRoot.querySelectorAll ? nodeRoot.querySelectorAll('*') : [];
-            for (const el of all) {
-                list.push(el);
-                if (el.shadowRoot) walk(el.shadowRoot);
-                if (el.tagName === 'IFRAME') {
-                    try { if (el.contentDocument) walk(el.contentDocument); } catch (e) {}
+    const renderBadge = (pulse = false) => {
+        if (!isTop || !doc.body || !isActiveGen()) return;
+        const refs = ensureBadge();
+        if (!refs) return;
+
+        const on = state.enabled;
+        const rpcOnline = !!G.rpcReady;
+
+        refs.el.style.background = on
+            ? (rpcOnline
+                ? 'linear-gradient(135deg, rgba(16,185,129,0.94), rgba(5,150,105,0.94))'
+                : 'linear-gradient(135deg, rgba(14,165,133,0.92), rgba(13,148,136,0.92))')
+            : 'linear-gradient(135deg, rgba(75,85,99,0.92), rgba(55,65,81,0.92))';
+        refs.el.style.border = on
+            ? '1px solid rgba(167,243,208,0.4)'
+            : '1px solid rgba(156,163,175,0.28)';
+
+        refs.dotEl.style.background = on ? '#a7f3d0' : '#9ca3af';
+        refs.dotEl.style.boxShadow = on ? '0 0 5px #a7f3d0' : 'none';
+        refs.labelEl.textContent = on ? '自动' : '暂停';
+        refs.engineEl.textContent = on ? (rpcOnline ? '双擎' : '点控') : '';
+        refs.engineEl.style.display = on ? 'inline' : 'none';
+        refs.countEl.textContent = String(state.count);
+
+        refs.el.title = [
+            `Muse 自动审批 v${VERSION}`,
+            `状态：${on ? '运行中' : '已暂停'} | 通道：${rpcOnline ? 'RPC已连 + 页面兜底' : '页面精点中（后台等RPC连接）'}`,
+            `真实通过：${state.count} 次（直通 ${state.rpcCount} / 点击 ${state.domCount}）`,
+            `最近：${lastActionSummary}`,
+            '操作：按住拖动 | 左键开关 | 右键清零',
+        ].join('\n');
+
+        if (pulse) {
+            refs.el.style.transform = 'scale(1.08)';
+            setTimeout(() => {
+                if (refs.el && refs.el.isConnected) refs.el.style.transform = '';
+            }, 180);
+        }
+    };
+
+    const recordApproved = (source, detailText) => {
+        if (!isActiveGen()) return;
+        const summary = `${source === 'rpc' ? '直通' : '点击'} · ${detailText || '已放行'}`;
+        if (isTop) {
+            state.count++;
+            if (source === 'rpc') state.rpcCount++;
+            else state.domCount++;
+            lastActionSummary = summary;
+            saveState();
+            renderBadge(true);
+        } else {
+            try {
+                win.top.postMessage({
+                    type: 'MUSE_AA_APPROVED',
+                    source,
+                    detail: detailText || '',
+                }, '*');
+            } catch (e) {}
+        }
+    };
+
+    const broadcastEnabledToFrames = (enabled) => {
+        if (!isTop) return;
+        try {
+            const iframes = doc.querySelectorAll('iframe');
+            for (const frame of iframes) {
+                try {
+                    if (frame.contentWindow) {
+                        frame.contentWindow.postMessage({ type: 'MUSE_AA_SYNC', enabled }, '*');
+                    }
+                } catch (e) {}
+            }
+        } catch (e) {}
+    };
+
+    const onWindowMessage = (e) => {
+        if (!isActiveGen() || !e || !e.data || typeof e.data !== 'object') return;
+        if (!isAllowedOrigin(e.origin)) return;
+        if (e.data.type === 'MUSE_AA_APPROVED' && isTop) {
+            recordApproved(e.data.source === 'rpc' ? 'rpc' : 'dom', e.data.detail);
+        } else if (e.data.type === 'MUSE_AA_SYNC' && !isTop && typeof e.data.enabled === 'boolean') {
+            state.enabled = e.data.enabled;
+            if (state.enabled) scheduleDomScanSoon(80);
+        }
+    };
+
+    const onStorageSync = (e) => {
+        if (!isActiveGen() || !e || e.key !== STORAGE_KEY || !e.newValue) return;
+        try {
+            const next = JSON.parse(e.newValue);
+            if (next && typeof next.enabled === 'boolean') {
+                state.enabled = next.enabled;
+                if (isTop) {
+                    if (typeof next.count === 'number') state.count = next.count;
+                    if (typeof next.rpcCount === 'number') state.rpcCount = next.rpcCount;
+                    if (typeof next.domCount === 'number') state.domCount = next.domCount;
+                    renderBadge();
+                }
+            }
+        } catch (err) {}
+    };
+
+    const onResize = () => {
+        if (!badgeRefs || !badgeRefs.el || !badgeRefs.el.isConnected) return;
+        if (badgeRefs.el.style.left) {
+            const rect = badgeRefs.el.getBoundingClientRect();
+            const p = clampBadgePosition(badgeRefs.el, rect.left, rect.top);
+            badgeRefs.el.style.left = p.left + 'px';
+            badgeRefs.el.style.top = p.top + 'px';
+        }
+    };
+
+    // =========================================================================
+    // 引擎 A：RPC 静默直通引擎（React 18/19 Fiber 提取 + 永久允许优先 + 自动降级）
+    // =========================================================================
+
+    function fiberOf(el) {
+        if (!el) return null;
+        try {
+            for (const k of Object.keys(el)) {
+                if (k.startsWith('__reactContainer') || k.startsWith('__reactFiber')) {
+                    return el[k];
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function findRootFiber() {
+        const sels = ['#__next', '#root', '#app', '[data-reactroot]', 'main', 'body', 'html'];
+        for (const sel of sels) {
+            const el = doc.querySelector(sel);
+            const f = fiberOf(el);
+            if (f) {
+                let r = f;
+                while (r && r.return) r = r.return;
+                return r || f;
+            }
+        }
+        const all = doc.querySelectorAll('*');
+        const limit = Math.min(all.length, 2500);
+        for (let i = 0; i < limit; i++) {
+            const f = fiberOf(all[i]);
+            if (f) {
+                let r = f;
+                while (r && r.return) r = r.return;
+                return r || f;
+            }
+        }
+        return null;
+    }
+
+    function collectFiberContexts() {
+        const root = findRootFiber();
+        if (!root) return [];
+        const out = [];
+        const seen = new Set();
+        const stack = [root];
+        let guard = 0;
+        while (stack.length && guard++ < 200000) {
+            const f = stack.pop();
+            if (!f || typeof f !== 'object' || seen.has(f)) continue;
+            seen.add(f);
+
+            // 路径 1：Consumer dependencies.firstContext 链（避开已重置的 context._currentValue）
+            const deps = f.dependencies;
+            if (deps && deps.firstContext) {
+                let c = deps.firstContext;
+                let n = 0;
+                while (c && n++ < 200) {
+                    if (c.memoizedValue !== undefined) {
+                        out.push({ value: c.memoizedValue, source: 'consumer' });
+                    }
+                    c = c.next;
+                }
+            }
+
+            // 路径 2：Provider memoizedProps.value（兼容 React 18 Provider 与 React 19 Context 组件）
+            const fType = f.type;
+            if (fType && typeof fType === 'object' && ('_context' in fType || '_currentValue' in fType)) {
+                if (f.memoizedProps && 'value' in f.memoizedProps && f.memoizedProps.value !== undefined) {
+                    out.push({ value: f.memoizedProps.value, source: 'provider' });
+                }
+            }
+
+            if (f.child) stack.push(f.child);
+            if (f.sibling) stack.push(f.sibling);
+        }
+        return out;
+    }
+
+    function isRpcCtx(v) {
+        if (!v || typeof v !== 'object' || typeof v.sendRequest !== 'function') return false;
+        let score = 0;
+        if ('gatewayUrl' in v) score++;
+        if ('ensureLiveConnection' in v) score++;
+        if ('connectionState' in v) score++;
+        if ('connectionAuthority' in v) score++;
+        if ('isReady' in v) score++;
+        return score >= 2;
+    }
+
+    function isUsableRpcCtx(v) {
+        if (!isRpcCtx(v)) return false;
+        if (v.connectionState === 'disconnected' || v.connectionState === 'closed' || v.connectionState === 'error') {
+            return false;
+        }
+        if ('isReady' in v) return v.isReady === true;
+        return v.connectionState === 'connected';
+    }
+
+    function invalidateRpcCtx() {
+        G.ctx = null;
+        G.scanRes = null;
+        G.scanAt = 0;
+        if (G.rpcReady) {
+            G.rpcReady = false;
+            renderBadge();
+        }
+    }
+
+    // 严格区分“已就绪 context”与“尚未就绪的候选 context”，根治假就绪 Bug
+    function findRpcCtx({ allowPending = false } = {}) {
+        if (G.ctx) {
+            if (isUsableRpcCtx(G.ctx)) return G.ctx;
+            G.ctx = null;
+        }
+
+        const now = Date.now();
+        if (now - G.scanAt < 800) {
+            if (isUsableRpcCtx(G.scanRes)) {
+                G.ctx = G.scanRes;
+                return G.scanRes;
+            }
+            return allowPending && isRpcCtx(G.scanRes) ? G.scanRes : null;
+        }
+
+        const candidates = collectFiberContexts().filter((c) => isRpcCtx(c.value));
+        G.scanAt = now;
+        if (!candidates.length) {
+            G.scanRes = null;
+            return null;
+        }
+
+        const readyHit = candidates.find((c) => isUsableRpcCtx(c.value));
+        if (readyHit) {
+            G.ctx = readyHit.value;
+            G.scanRes = readyHit.value;
+            return readyHit.value;
+        }
+
+        const pendingHit =
+            candidates.find((c) => c.value.connectionState === 'connected') ||
+            candidates.find((c) => c.value.gatewayUrl) ||
+            candidates[0];
+        G.scanRes = pendingHit.value;
+        return allowPending ? pendingHit.value : null;
+    }
+
+    function getTargetOpts(ctx) {
+        const key = ctx && ctx.connectionAuthority && ctx.connectionAuthority.targetKey;
+        return key ? { expectedTargetKey: key } : {};
+    }
+
+    async function rpcCall(method, payload, opts) {
+        let ctx = findRpcCtx({ allowPending: true });
+        if (!ctx) {
+            throw new Error('未找到 HatchRpc context（页面可能尚未连接 VM）');
+        }
+        if (!isUsableRpcCtx(ctx)) {
+            if (typeof ctx.ensureLiveConnection === 'function') {
+                await ctx.ensureLiveConnection();
+            }
+            const refreshed = findRpcCtx({ allowPending: true });
+            if (refreshed) ctx = refreshed;
+        }
+        if (!isUsableRpcCtx(ctx)) {
+            throw new Error('HatchRpc is not ready');
+        }
+        const finalOpts = { ...getTargetOpts(ctx), ...(opts || {}) };
+        return ctx.sendRequest(method, payload ?? {}, finalOpts);
+    }
+
+    function isConnectionError(err) {
+        const msg = (err && err.message) ? err.message : String(err || '');
+        return /not ready|not connected|disconnected|socket|closed|timeout|target|network|reconnect/i.test(msg);
+    }
+
+    function isDecisionRejectedError(err) {
+        const msg = (err && err.message) ? err.message : String(err || '');
+        if (isConnectionError(err)) return false;
+        return /decision|allow_always|not allowed|unsupported|invalid|forbidden|cannot|only|400|bad request|disallowed|policy/i.test(msg);
+    }
+
+    function isRpcResultRejected(res) {
+        if (!res || typeof res !== 'object') return false;
+        if (res.ok === false || res.success === false || res.accepted === false) return true;
+        if (typeof res.error === 'string' && res.error) return true;
+        if (res.error && typeof res.error === 'object' && res.error.message) return true;
+        return false;
+    }
+
+    function pendingOf(r) {
+        if (!r || typeof r !== 'object') return [];
+        const c = r.pending_approvals ?? (r.approvals && r.approvals.pending) ?? r.pending ?? [];
+        return Array.isArray(c) ? c : [];
+    }
+
+    const idOf = (a) => (a && (a.approval_id ?? a.approvalId ?? a.id)) || null;
+    const titleOf = (a) => (a && (a.title ?? a.request_name ?? a.summary ?? a.method ?? a.connector)) || '';
+
+    // 档位选择链：严格优先永久/全部允许，服务端不允许时自动降级到单次允许
+    function buildDecisionChain(approval, preferred = 'allow_always') {
+        const pref = preferred || 'allow_always';
+        const fallbackOrder = pref === 'allow_always'
+            ? ['allow_always', 'allow_once', 'allow']
+            : [pref, 'allow_always', 'allow_once', 'allow'];
+
+        const rawOpts = approval && (
+            approval.allowed_decisions ||
+            approval.allowedDecisions ||
+            approval.decision_options ||
+            approval.decisions ||
+            approval.mode_options
+        );
+
+        if (Array.isArray(rawOpts) && rawOpts.length) {
+            const norm = rawOpts
+                .map((x) => (typeof x === 'string' ? x : (x && (x.value || x.decision || x.id))))
+                .filter((x) => typeof x === 'string');
+            if (norm.length) {
+                const priority = ['allow_always', 'always_allow', 'allow_all', 'allow_once', 'allow', 'approve'];
+                const matched = [];
+                if (norm.includes(pref)) matched.push(pref);
+                for (const p of priority) {
+                    if (norm.includes(p) && !matched.includes(p)) matched.push(p);
+                }
+                if (matched.length) return matched;
+            }
+        }
+        return [...new Set(fallbackOrder)];
+    }
+
+    async function decideRaw(approvalId, decision = 'allow_always', opts = {}) {
+        if (!approvalId) throw new Error('缺少 approvalId');
+        const payload = { approval_id: approvalId, decision };
+        if (opts.alwaysScope) {
+            payload.always_scope = opts.alwaysScope;
+            if (decision === 'allow_always') payload.allow_always_scope = opts.alwaysScope;
+        }
+        if (opts.reason) payload.reason = opts.reason;
+        const res = await rpcCall('egress.approval.decide', payload);
+        if (isRpcResultRejected(res)) {
+            const errMsg = (res.error && res.error.message) || res.error || res.message || `decision ${decision} rejected`;
+            throw new Error(String(errMsg));
+        }
+        return res;
+    }
+
+    async function decideSmart(approval, preferred = state.decision, opts = {}) {
+        const approvalId = typeof approval === 'string' ? approval : idOf(approval);
+        const chain = typeof approval === 'string'
+            ? [...new Set([preferred || 'allow_always', 'allow_once', 'allow'])]
+            : buildDecisionChain(approval, preferred);
+
+        let lastErr = null;
+        for (let i = 0; i < chain.length; i++) {
+            const decision = chain[i];
+            try {
+                const res = await decideRaw(approvalId, decision, opts);
+                return { ok: true, decision, res };
+            } catch (e) {
+                lastErr = e;
+                // 连接异常：清缓存重扫后重试同一档位一次，绝不错误降级
+                if (isConnectionError(e)) {
+                    invalidateRpcCtx();
+                    try {
+                        const res2 = await decideRaw(approvalId, decision, opts);
+                        return { ok: true, decision, res: res2 };
+                    } catch (e2) {
+                        throw e2;
+                    }
+                }
+                // 服务端明确不支持当前档位（如不能 allow_always）-> 自动降级到下一档
+                const hasNext = i + 1 < chain.length;
+                if (hasNext && (decision === 'allow_always' || isDecisionRejectedError(e))) {
+                    continue;
+                }
+                throw e;
+            }
+        }
+        throw lastErr || new Error('审批应答失败');
+    }
+
+    let rpcTickRunning = false;
+    let rpcProbeDelay = 1200;
+
+    function pruneRpcMaps(activeIds) {
+        const now = Date.now();
+        for (const [id, ts] of G.seen.entries()) {
+            if (!activeIds.has(id) && now - ts > 600000) G.seen.delete(id);
+        }
+        for (const id of G.failState.keys()) {
+            if (!activeIds.has(id)) G.failState.delete(id);
+        }
+    }
+
+    async function rpcTick() {
+        if (!isTop || !isActiveGen() || rpcTickRunning) return;
+        rpcTickRunning = true;
+        let nextDelay = state.rpcIntervalMs || 1800;
+
+        try {
+            if (!state.enabled) {
+                nextDelay = 2000;
+                return;
+            }
+
+            // 探测真正就绪的 context
+            const readyCtx = findRpcCtx({ allowPending: false });
+            if (!readyCtx) {
+                if (G.rpcReady) {
+                    G.rpcReady = false;
+                    renderBadge();
+                }
+                rpcProbeDelay = Math.min(Math.round(rpcProbeDelay * 1.25), 5000);
+                nextDelay = rpcProbeDelay;
+                return;
+            }
+
+            rpcProbeDelay = 1200;
+            if (!G.rpcReady) {
+                G.rpcReady = true;
+                renderBadge();
+                console.log(TAG, 'RPC 直通通道已就绪，双擎协同运行中');
+            }
+
+            const resp = await rpcCall('egress.approvals', {});
+            const list = pendingOf(resp);
+            const activeIds = new Set();
+            const now = Date.now();
+
+            for (const item of list) {
+                if (!isActiveGen() || !state.enabled) break;
+                const id = idOf(item);
+                if (!id) continue;
+                activeIds.add(id);
+
+                if (G.seen.has(id) || G.inFlight.has(id)) continue;
+
+                const fs = G.failState.get(id);
+                if (fs && now < fs.nextTryAt) continue;
+
+                // 请求发出前立刻占坑，彻底杜绝并发重复批
+                G.inFlight.add(id);
+                const title = titleOf(item);
+                try {
+                    const out = await decideSmart(item, state.decision);
+                    G.seen.set(id, Date.now());
+                    G.failState.delete(id);
+                    G.lastRpcApproveAt = Date.now();
+                    const tierLabel = out.decision === 'allow_always' ? '永久允许' : out.decision;
+                    G.rpcLog.push({ id, title, decision: out.decision, ok: true, at: Date.now() });
+                    if (G.rpcLog.length > 200) G.rpcLog.shift();
+                    recordApproved('rpc', `${tierLabel}${title ? ' · ' + title : ''}`);
+                    console.log(TAG, `✓ [RPC ${tierLabel}]`, id, title);
+                } catch (err) {
+                    const prev = G.failState.get(id) || { count: 0, nextTryAt: 0 };
+                    const count = prev.count + 1;
+                    // 指数退避（2s -> 4s -> 8s -> 16s -> 30s -> 45s），永不永久拉黑
+                    const backoff = Math.min(2000 * Math.pow(2, Math.min(count - 1, 4)), 45000);
+                    G.failState.set(id, { count, nextTryAt: Date.now() + backoff });
+                    const msg = (err && err.message) ? err.message : String(err);
+                    G.rpcLog.push({ id, title, ok: false, error: msg, count, at: Date.now() });
+                    if (G.rpcLog.length > 200) G.rpcLog.shift();
+                    if (count <= 2 || count % 5 === 0) {
+                        console.warn(TAG, `✗ [RPC 重试#${count}，${Math.round(backoff / 1000)}s后再试]`, id, msg);
+                    }
+                    if (isConnectionError(err)) {
+                        invalidateRpcCtx();
+                        break;
+                    }
+                } finally {
+                    G.inFlight.delete(id);
+                }
+            }
+
+            pruneRpcMaps(activeIds);
+        } catch (e) {
+            if (isConnectionError(e)) {
+                invalidateRpcCtx();
+            }
+        } finally {
+            rpcTickRunning = false;
+            if (isActiveGen()) {
+                owned.rpcTimer = setTimeout(rpcTick, nextDelay);
+            }
+        }
+    }
+
+    let lastRpcWakeAt = 0;
+    function wakeRpcSoon() {
+        if (!isTop || !isActiveGen() || !state.enabled || !G.rpcReady) return;
+        const now = Date.now();
+        if (rpcTickRunning || now - lastRpcWakeAt < 350) return;
+        lastRpcWakeAt = now;
+        if (owned.rpcWakeTimer) clearTimeout(owned.rpcWakeTimer);
+        owned.rpcWakeTimer = setTimeout(() => {
+            owned.rpcWakeTimer = null;
+            if (!isActiveGen() || !state.enabled || rpcTickRunning) return;
+            if (owned.rpcTimer) {
+                clearTimeout(owned.rpcTimer);
+                owned.rpcTimer = null;
+            }
+            rpcTick();
+        }, 90);
+    }
+
+    // =========================================================================
+    // 引擎 B：DOM 穿透精准点击引擎（四级档位 + 上下文防误点 + 验成败计数）
+    // =========================================================================
+
+    const NEGATIVE_RE = /拒绝|不允许|不同意|取消|暂不|停止|删除|移除|撤回|关闭|退出|\b(deny|reject|disallow|cancel|decline|block|revoke|delete|remove|dismiss|close)\b/i;
+
+    const REJECT_PAIR_RE = /拒绝|不允许|不同意|全部拒绝|暂不|取消|\b(deny|reject|decline|cancel|disallow|deny all|reject all|do not allow|don't allow)\b/i;
+
+    const APPROVAL_CLUES = [
+        '需要批准', '需要审批', '需要审核', '需要确认', '需要你的确认',
+        '请求权限', '权限请求', '待审批', '审批请求', '操作确认',
+        '允许 muse', '允许muse', '允许此操作', '允许该操作',
+        '上传这个文件', '上传文件', '创建公开链接', '公开链接', '授予权限',
+        'approval required', 'permission required', 'pending approval',
+        'needs approval', 'requires approval', 'requesting permission',
+        'allow muse', 'approve action', 'approve this', 'grant permission',
+        'wants to', 'upload this file', 'public link', 'confirm action',
+    ];
+
+    // 四级档位词典（严格优先：全部/永久 > 永久/始终 > 批量单次 > 单个允许）
+    const TIER1_EXACT = new Set([
+        '全部永久允许', '全部始终允许', '始终全部允许', '永久全部允许',
+        '全部允许', '允许全部', '全部批准', '批准全部', '一律允许', '全部同意',
+        'always allow all', 'allow all always', 'allow all', 'approve all', 'permit all',
+    ]);
+    const TIER2_EXACT = new Set([
+        '永久允许', '始终允许', '总是允许', '一直允许', '永久批准', '始终批准', '一律放行',
+        'allow always', 'always allow', 'approve always', 'always approve', 'permit always', 'trust always',
+    ]);
+    const TIER3_EXACT = new Set([
+        '全部允许一次', '全部批准一次', '本次全部允许', '允许全部一次',
+        'allow all once', 'approve all once',
+    ]);
+    const TIER4_EXACT = new Set([
+        '允许', '允许一次', '本次允许', '仅允许本次', '仅此一次', '批准', '批准一次', '确认允许', '同意',
+        'allow', 'allow once', 'approve', 'approve once', 'permit',
+    ]);
+
+    const INTERACTIVE_SELECTOR = 'button, [role="button"], a[role="button"], input[type="button"], input[type="submit"]';
+    const FORBIDDEN_ANCESTOR_SELECTOR = 'pre, code, nav, [role="navigation"], [role="menubar"], [inert], [data-muse-aa-ui="1"]';
+
+    const domCooldownMap = new WeakMap();
+    const domPendingVerify = new WeakSet();
+    const domFirstSeenMap = new WeakMap();
+    const domFailCountMap = new WeakMap();
+    let lastDomClickAt = 0;
+
+    function getParentAcrossShadow(node) {
+        if (!node) return null;
+        if (node.parentElement) return node.parentElement;
+        try {
+            const root = node.getRootNode && node.getRootNode();
+            if (root && root.host) return root.host;
+        } catch (e) {}
+        return null;
+    }
+
+    function hasForbiddenAncestor(el) {
+        let cur = el;
+        let steps = 0;
+        while (cur && steps++ < 15) {
+            if (cur.id === BADGE_ID) return true;
+            try {
+                if (cur.matches && cur.matches(FORBIDDEN_ANCESTOR_SELECTOR)) return true;
+            } catch (e) {}
+            cur = getParentAcrossShadow(cur);
+        }
+        return false;
+    }
+
+    function extractVisibleText(el) {
+        if (!el) return '';
+        if (el.tagName === 'INPUT') {
+            return String(el.value || el.getAttribute('aria-label') || '');
+        }
+        let buf = '';
+        const walk = (node) => {
+            if (!node) return;
+            if (node.nodeType === 3) {
+                buf += node.nodeValue || '';
+                return;
+            }
+            if (node.nodeType !== 1) return;
+            const tag = node.tagName;
+            if (tag === 'SVG' || tag === 'STYLE' || tag === 'SCRIPT' || tag === 'NOSCRIPT') return;
+            if (node.getAttribute && node.getAttribute('aria-hidden') === 'true') return;
+            const children = node.childNodes;
+            if (children) {
+                for (let i = 0; i < children.length; i++) walk(children[i]);
+            }
+        };
+        walk(el);
+        const trimmed = buf.replace(/\s+/g, ' ').trim();
+        if (trimmed) return trimmed;
+        return String(el.getAttribute && el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function normalizeButtonText(raw) {
+        if (!raw) return '';
+        let t = String(raw).replace(/\s+/g, ' ').trim();
+        // 去掉末尾常见角标、数字计数与快捷键提示：如 "全部允许 (3)"、"Allow always ↵"、"全部允许 · 2"
+        t = t
+            .replace(/\s*[\(（\[]\s*\d+\s*[\)）\]]\s*$/u, '')
+            .replace(/\s*[·•\-|]\s*\d+\s*$/u, '')
+            .replace(/\s*(↵|⏎|⌘↵|ctrl\+enter|enter)\s*$/iu, '')
+            .replace(/\s+\d+\s*$/u, '')
+            .replace(/^[\s✓✔✅⚡•·]+|[\s✓✔✅⚡•·]+$/gu, '')
+            .trim();
+        return t.toLowerCase();
+    }
+
+    function classifyButtonTier(rawText) {
+        if (!rawText || rawText.length > 36) return 0;
+        if (NEGATIVE_RE.test(rawText)) return 0;
+        const norm = normalizeButtonText(rawText);
+        if (!norm || norm.length > 28) return 0;
+        if (NEGATIVE_RE.test(norm)) return 0;
+        if (TIER1_EXACT.has(norm)) return 1;
+        if (TIER2_EXACT.has(norm)) return 2;
+        if (TIER3_EXACT.has(norm)) return 3;
+        if (TIER4_EXACT.has(norm)) return 4;
+        return 0;
+    }
+
+    function isDisabledButton(el) {
+        if (!el) return true;
+        if (el.disabled === true) return true;
+        if (el.getAttribute && (el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled'))) return true;
+        return false;
+    }
+
+    function isVisibleButton(el) {
+        if (!el || !el.isConnected) return false;
+        try {
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 15 || rect.height < 12 || rect.width > 360 || rect.height > 110) return false;
+            const style = win.getComputedStyle(el);
+            if (!style) return true;
+            if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') return false;
+            if (parseFloat(style.opacity) < 0.1) return false;
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function hasReactOnClick(el) {
+        if (!el) return false;
+        try {
+            for (const k of Object.keys(el)) {
+                if ((k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$')) &&
+                    el[k] && typeof el[k].onClick === 'function') {
+                    return true;
+                }
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    // 审批上下文校验：彻底根治误点页面普通“允许/Allow/Approve”按钮
+    function verifyApprovalContext(btn, tier, isStandardInteractive) {
+        if (hasForbiddenAncestor(btn)) return { ok: false };
+
+        const role = ((btn.getAttribute && btn.getAttribute('role')) || '').toLowerCase();
+        if (role === 'switch' || role === 'checkbox' || role === 'radio' || role === 'tab' ||
+            role === 'menuitemcheckbox' || role === 'menuitemradio') {
+            return { ok: false };
+        }
+
+        let cur = getParentAcrossShadow(btn);
+        for (let depth = 0; depth < 7 && cur; depth++) {
+            const tag = (cur.tagName || '').toUpperCase();
+            if (tag === 'BODY' || tag === 'HTML') break;
+
+            // 判据 1：同一卡片/弹窗内存在配对的“拒绝/取消”类按钮（最铁审批特征）
+            if (cur.querySelectorAll) {
+                const peers = cur.querySelectorAll(INTERACTIVE_SELECTOR);
+                for (let i = 0; i < peers.length && i < 40; i++) {
+                    const peer = peers[i];
+                    if (peer === btn || !peer.isConnected) continue;
+                    const pText = extractVisibleText(peer);
+                    if (pText && pText.length <= 28 && REJECT_PAIR_RE.test(pText)) {
+                        return { ok: true, clue: `配对按钮:${pText}` };
+                    }
+                }
+            }
+
+            // 判据 2：祖先容器包含明确的审批/权限提示语（且容器文字量合理，非整页正文）
+            const cText = (cur.textContent || '').replace(/\s+/g, ' ').trim();
+            if (cText.length > 0 && cText.length <= 2600) {
+                const lower = cText.toLowerCase();
+                for (let i = 0; i < APPROVAL_CLUES.length; i++) {
+                    if (lower.includes(APPROVAL_CLUES[i])) {
+                        return { ok: true, clue: `卡片文案:${APPROVAL_CLUES[i]}` };
+                    }
+                }
+            }
+
+            // 如果已经爬到一个明确的弹窗/对话框外层还没命中，也继续检查上一层直到上限
+            cur = getParentAcrossShadow(cur);
+        }
+
+        // 判据 3：Tier 1~3 属于高置信度批量/永久审批专有词，标准交互按钮且非设置控件允许放行
+        if (tier <= 3 && isStandardInteractive) {
+            return { ok: true, clue: `专有批量档位T${tier}` };
+        }
+
+        return { ok: false };
+    }
+
+    function getActiveShadowRoots() {
+        const roots = [];
+        for (const ref of G.shadowRefs) {
+            const sr = (ref && typeof ref.deref === 'function') ? ref.deref() : ref;
+            if (!sr || (sr.host && !sr.host.isConnected)) {
+                G.shadowRefs.delete(ref);
+                continue;
+            }
+            roots.push(sr);
+        }
+        return roots;
+    }
+
+    function collectCandidateRoots() {
+        const roots = [];
+        const visited = new Set();
+
+        const addRoot = (r) => {
+            if (!r || visited.has(r)) return;
+            visited.add(r);
+            roots.push(r);
+
+            // 探索已打开的 shadowRoot 和同源 iframe
+            if (r.querySelectorAll) {
+                const iframes = r.querySelectorAll('iframe');
+                for (let i = 0; i < iframes.length; i++) {
+                    try {
+                        if (iframes[i].contentDocument) addRoot(iframes[i].contentDocument);
+                    } catch (e) {}
                 }
             }
         };
-        walk(root);
-        shadowRoots.forEach(sr => walk(sr));
-        return list;
-    };
 
-    // 4. 全方位触发点击
-    const realClick = (el) => {
-        const fire = (node) => {
-            if (!node) return;
-            try {
-                const rect = node.getBoundingClientRect();
-                const x = rect.left + rect.width / 2;
-                const y = rect.top + rect.height / 2;
-                const opts = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0, buttons: 1 };
-                node.dispatchEvent(new PointerEvent('pointerdown', opts));
-                node.dispatchEvent(new MouseEvent('mousedown', opts));
-                node.dispatchEvent(new PointerEvent('pointerup', opts));
-                node.dispatchEvent(new MouseEvent('mouseup', opts));
-                node.click();
+        addRoot(doc);
+        const shadows = getActiveShadowRoots();
+        for (let i = 0; i < shadows.length; i++) {
+            addRoot(shadows[i]);
+        }
+        return roots;
+    }
 
-                for (const k of Object.keys(node)) {
+    function findBestApprovalButton(now) {
+        const roots = collectCandidateRoots();
+        const checkedNodes = new Set();
+        let best = null; // { target, rawText, tier, clue }
+
+        const considerNode = (el, isStandardInteractive) => {
+            if (!el || checkedNodes.has(el)) return;
+            checkedNodes.add(el);
+
+            const target = (el.closest && el.closest(INTERACTIVE_SELECTOR)) || el;
+            if (target !== el && checkedNodes.has(target)) return;
+            checkedNodes.add(target);
+
+            if (isDisabledButton(target) || domPendingVerify.has(target)) return;
+            const lastClick = domCooldownMap.get(target) || 0;
+            if (now - lastClick < 1500) return;
+
+            const rawText = extractVisibleText(target);
+            const tier = classifyButtonTier(rawText);
+            if (!tier) return;
+
+            // 已有同级或更高档位候选时跳过，省去几何与上下文检查开销
+            if (best && tier >= best.tier) return;
+
+            if (!isVisibleButton(target)) return;
+
+            // 非标准按钮（如自定义 div/span）要求具备明确点击特征
+            if (!isStandardInteractive) {
+                let clickable = hasReactOnClick(target);
+                if (!clickable) {
+                    try {
+                        const style = win.getComputedStyle(target);
+                        clickable = !!(style && style.cursor === 'pointer');
+                    } catch (e) {}
+                }
+                if (!clickable) return;
+            }
+
+            const ctx = verifyApprovalContext(target, tier, isStandardInteractive);
+            if (!ctx.ok) return;
+
+            best = { target, rawText, tier, clue: ctx.clue };
+        };
+
+        // 第一梯队：标准交互按钮（极快）
+        for (let r = 0; r < roots.length; r++) {
+            const root = roots[r];
+            if (!root.querySelectorAll) continue;
+            const btns = root.querySelectorAll(INTERACTIVE_SELECTOR);
+            for (let i = 0; i < btns.length; i++) {
+                considerNode(btns[i], true);
+            }
+        }
+
+        // 第二梯队：若未找到标准按钮，补充检查对话框/审批卡片中的自定义可点击元素（兼容非 button 实现）
+        if (!best) {
+            const containerSel = '[role="dialog"], [role="alertdialog"], [data-state="open"], [data-radix-popper-content-wrapper], [class*="approval" i], [class*="permission" i], [class*="modal" i], [class*="confirm" i]';
+            for (let r = 0; r < roots.length; r++) {
+                const root = roots[r];
+                if (!root.querySelectorAll) continue;
+                const dialogs = root.querySelectorAll(containerSel);
+                for (let d = 0; d < dialogs.length; d++) {
+                    const nodes = dialogs[d].querySelectorAll('div, span, a');
+                    const limit = Math.min(nodes.length, 300);
+                    for (let i = 0; i < limit; i++) {
+                        const n = nodes[i];
+                        if (n.childElementCount > 3) continue;
+                        considerNode(n, false);
+                    }
+                }
+            }
+        }
+
+        return best;
+    }
+
+    function dispatchClickChain(el, forceReactCallback = false) {
+        if (!el) return;
+        try {
+            const rect = el.getBoundingClientRect();
+            const clientX = rect.left + rect.width / 2;
+            const clientY = rect.top + rect.height / 2;
+            const opts = {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: win,
+                clientX,
+                clientY,
+                button: 0,
+                buttons: 1,
+            };
+            try { el.dispatchEvent(new PointerEvent('pointerover', opts)); } catch (e) {}
+            try { el.dispatchEvent(new MouseEvent('mouseover', opts)); } catch (e) {}
+            try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (e) {}
+            try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch (e) {}
+            if (typeof el.focus === 'function') {
+                try { el.focus({ preventScroll: true }); } catch (e) {}
+            }
+            try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
+            try { el.dispatchEvent(new MouseEvent('mouseup', opts)); } catch (e) {}
+            if (typeof el.click === 'function') {
+                el.click();
+            } else {
+                el.dispatchEvent(new MouseEvent('click', opts));
+            }
+
+            // 仅在普通事件链未生效的重试破冰模式下，才追加直调 React onClick，避免单次点击双触发
+            if (forceReactCallback) {
+                for (const k of Object.keys(el)) {
                     if (k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$')) {
-                        if (node[k] && typeof node[k].onClick === 'function') {
-                            node[k].onClick({ target: node, currentTarget: node, preventDefault() {}, stopPropagation() {} });
+                        const props = el[k];
+                        if (props && typeof props.onClick === 'function') {
+                            props.onClick({
+                                target: el,
+                                currentTarget: el,
+                                preventDefault() {},
+                                stopPropagation() {},
+                                nativeEvent: new MouseEvent('click', opts),
+                            });
+                            break;
                         }
                     }
                 }
-            } catch (e) {}
+            }
+        } catch (e) {}
+    }
+
+    // 延迟验证点击是否真正生效：只有按钮消失/禁用/文案变化才计入真实通过
+    function verifyDomClickOutcome(btn, rawText, tier, clue) {
+        domPendingVerify.add(btn);
+        const checkpoints = [220, 520, 950];
+        let idx = 0;
+
+        const check = () => {
+            if (!isActiveGen()) {
+                domPendingVerify.delete(btn);
+                return;
+            }
+            const gone = !btn.isConnected;
+            const disabled = !gone && isDisabledButton(btn);
+            const hidden = !gone && !isVisibleButton(btn);
+            const textChanged = !gone && !disabled && !hidden && (classifyButtonTier(extractVisibleText(btn)) === 0);
+
+            if (gone || disabled || hidden || textChanged) {
+                domPendingVerify.delete(btn);
+                domFailCountMap.delete(btn);
+                G.domLog.push({ text: rawText, tier, clue, ok: true, at: Date.now() });
+                if (G.domLog.length > 200) G.domLog.shift();
+                recordApproved('dom', rawText);
+                console.log(TAG, `✓ [页面精点 T${tier}] 已生效「${rawText}」(${clue})`);
+                return;
+            }
+
+            idx++;
+            if (idx < checkpoints.length) {
+                const delta = checkpoints[idx] - checkpoints[idx - 1];
+                setTimeout(check, delta);
+            } else {
+                // 超过 950ms 仍纹丝不动：不虚增计数，记录一次失败以便下轮升级破冰模式
+                domPendingVerify.delete(btn);
+                const fails = (domFailCountMap.get(btn) || 0) + 1;
+                domFailCountMap.set(btn, fails);
+                G.domLog.push({ text: rawText, tier, clue, ok: false, fails, at: Date.now() });
+                if (G.domLog.length > 200) G.domLog.shift();
+                console.warn(TAG, `⚠ [页面精点未生效#${fails}]「${rawText}」，不计入通过数，稍后升级重试`);
+            }
         };
 
-        const btn = (el.closest && el.closest('button, [role="button"]')) || el;
-        fire(btn);
-        if (btn !== el) fire(el);
-    };
+        setTimeout(check, checkpoints[0]);
+    }
 
-    const BATCH_TEXTS = ['全部允许一次', '全部允许', '始终允许', 'Allow all once', 'Allow all'];
-    const SINGLE_TEXTS = ['允许', '允许一次', '批准', 'Allow', 'Approve'];
-
-    const cooldownMap = new WeakMap();
-    let lastGlobalClick = 0;
-
-    const scan = () => {
-        if (isTop) updateBadge();
-        if (!isEnabled) return;
+    function domScan() {
+        if (!isActiveGen()) return;
+        if (isTop && doc.body && (!badgeRefs || !badgeRefs.el || !badgeRefs.el.isConnected)) {
+            renderBadge();
+        }
+        if (!state.enabled) return;
 
         const now = Date.now();
-        if (now - lastGlobalClick < 500) return;
+        if (now - lastDomClickAt < 420) return;
 
-        const elements = getAllElementsDeep();
-        let batchBtn = null;
-        let singleBtn = null;
+        const chosen = findBestApprovalButton(now);
+        if (!chosen) return;
 
-        for (const el of elements) {
-            if (el.id === 'muse-tm-badge-v63' || (el.closest && el.closest('#muse-tm-badge-v63'))) continue;
-
-            const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (!text || text.length > 15) continue;
-            if (text.includes('拒绝') || text.includes('取消') || text.includes('Deny')) continue;
-
-            const target = (el.closest && el.closest('button, [role="button"]')) || el;
-            const rect = target.getBoundingClientRect();
-            if (rect.width < 15 || rect.height < 12 || rect.width > 300 || rect.height > 100) continue;
-
-            const style = win.getComputedStyle(target);
-            if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) < 0.1) continue;
-
-            const lastClick = cooldownMap.get(target) || 0;
-            if (now - lastClick < 1500) continue;
-
-            if (BATCH_TEXTS.includes(text)) {
-                batchBtn = { target, text };
-                break;
+        // 双引擎协同礼让：顶层且 RPC 已就绪时，先唤醒 RPC 并礼让 450ms（让 RPC 用 allow_always 无声批掉）
+        if (isTop && G.rpcReady) {
+            wakeRpcSoon();
+            let firstSeen = domFirstSeenMap.get(chosen.target);
+            if (!firstSeen) {
+                firstSeen = now;
+                domFirstSeenMap.set(chosen.target, firstSeen);
             }
-
-            if (!singleBtn && SINGLE_TEXTS.includes(text)) {
-                singleBtn = { target, text };
+            const waitLimit = (G.inFlight.size > 0 || now - G.lastRpcApproveAt < 600) ? 1100 : 450;
+            if (now - firstSeen < waitLimit) {
+                if (!owned.domDeferTimer) {
+                    owned.domDeferTimer = setTimeout(() => {
+                        owned.domDeferTimer = null;
+                        domScan();
+                    }, Math.max(120, waitLimit - (now - firstSeen) + 30));
+                }
+                return;
             }
         }
 
-        const chosen = batchBtn || singleBtn;
-        if (chosen) {
-            lastGlobalClick = now;
-            cooldownMap.set(chosen.target, now);
-            realClick(chosen.target);
+        lastDomClickAt = now;
+        domCooldownMap.set(chosen.target, now);
+        const prevFails = domFailCountMap.get(chosen.target) || 0;
+        const useForceReact = prevFails >= 1;
 
-            if (isTop) {
-                approveCount++;
-                try { localStorage.setItem(STORAGE_KEY_COUNT, String(approveCount)); } catch (e) {}
-                updateBadge();
-            } else {
-                try { win.top.postMessage('MUSE_TM_CLICKED', '*'); } catch (e) {}
-            }
-        }
+        dispatchClickChain(chosen.target, useForceReact);
+        verifyDomClickOutcome(chosen.target, chosen.rawText, chosen.tier, chosen.clue);
+    }
+
+    function scheduleDomScanSoon(delayMs = 160) {
+        if (!isActiveGen() || !state.enabled) return;
+        if (owned.domThrottleTimer) return;
+        owned.domThrottleTimer = setTimeout(() => {
+            owned.domThrottleTimer = null;
+            domScan();
+        }, delayMs);
+    }
+
+    function attachObserver(root) {
+        if (!root || !isActiveGen() || owned.observedRoots.has(root)) return;
+        if (typeof MutationObserver === 'undefined') return;
+        try {
+            const obs = new MutationObserver(() => {
+                if (!isActiveGen()) {
+                    obs.disconnect();
+                    return;
+                }
+                if (state.enabled) scheduleDomScanSoon(160);
+            });
+            obs.observe(root, { childList: true, subtree: true });
+            owned.observers.add(obs);
+            owned.observedRoots.add(root);
+        } catch (e) {}
+    }
+
+    // 新捕获的 Closed Shadow DOM 自动挂监听
+    G.onShadowAttached = (sr) => {
+        if (isActiveGen()) attachObserver(sr);
     };
 
-    setInterval(scan, 350);
+    // =========================================================================
+    // 主开关与控制台高级工具（兼容 v2.3.0 __musePerm 全部接口并修复 RISKY）
+    // =========================================================================
+
+    function setEnabled(on) {
+        state.enabled = !!on;
+        saveState();
+        renderBadge();
+        broadcastEnabledToFrames(state.enabled);
+        if (state.enabled) {
+            scheduleDomScanSoon(50);
+            wakeRpcSoon();
+        }
+        return state.enabled;
+    }
+
+    function permsUnwrap(r) {
+        let v = r;
+        for (let i = 0; i < 4 && v && typeof v === 'object'; i++) {
+            if ('hitl_mode' in v) return v;
+            if (v.permissions && typeof v.permissions === 'object') { v = v.permissions; continue; }
+            break;
+        }
+        return (v && typeof v === 'object') ? v : {};
+    }
+
+    const RISKY = /(send|publish|post|delete|trash|remove|transfer|spend|purchase|checkout|payment|book|place|claim|revoke|delegated|execute|deploy|import|create|edit|update|manage|write|down|up_login)/i;
+
+    function exclude(list, patterns) {
+        const res = patterns.map((p) => (p instanceof RegExp ? p : new RegExp(p, 'i')));
+        return list.filter((r) => !res.some((re) => re.test(`${r.connector}.${r.method}`)));
+    }
+
+    async function getPermissions() {
+        return permsUnwrap(await rpcCall('egress.permissions', {}));
+    }
+
+    async function listApprovals() {
+        const list = pendingOf(await rpcCall('egress.approvals', {}));
+        console.log(TAG, `待审批 ${list.length} 项`);
+        if (list.length) console.table(list);
+        return list;
+    }
+
+    async function listConnectors() {
+        const p = await getPermissions();
+        const rows = [];
+        for (const c of (p.connectors || [])) {
+            const actions = (c.display && c.display.actions) || {};
+            for (const [m, mode] of Object.entries(c.methods || {})) {
+                rows.push({
+                    connector: c.connector,
+                    method: m,
+                    mode,
+                    canSet: (actions[m] && actions[m].mode_options ? actions[m].mode_options.join('/') : null),
+                    source: (c.method_sources && c.method_sources[m]) || null,
+                });
+            }
+        }
+        return rows;
+    }
+
+    async function listAsking() {
+        const rows = (await listConnectors()).filter((r) => r.mode === 'ask');
+        console.log(TAG, `当前为 ask 的权限项：${rows.length} 个`);
+        if (rows.length) console.table(rows);
+        return rows;
+    }
+
+    async function setConnector(name, methods) {
+        if (!name || !methods || typeof methods !== 'object') {
+            throw new Error('用法: connector(连接器名, { 方法名: "allow"|"ask"|"deny" })');
+        }
+        for (const [k, v] of Object.entries(methods)) {
+            if (!['allow', 'ask', 'deny'].includes(v)) throw new Error(`方法 ${k} 档位非法：${v}`);
+        }
+        return rpcCall('egress.permissions.connector', { connector: name, methods });
+    }
+
+    async function applyList(list, { confirm = false, delayMs = 250 } = {}) {
+        if (!list.length) return { changed: [], failed: [] };
+        const byConn = new Map();
+        for (const { connector: c, method } of list) {
+            if (!byConn.has(c)) byConn.set(c, {});
+            byConn.get(c)[method] = 'allow';
+        }
+        if (!confirm) {
+            console.log(TAG, `[预览] ${list.length} 个方法 / ${byConn.size} 个连接器 将改为 allow`);
+            console.table([...byConn].map(([c, m]) => ({ connector: c, 方法数: Object.keys(m).length })));
+            return { preview: true, connectors: byConn.size, methods: list.length };
+        }
+        const changed = [];
+        const failed = [];
+        let i = 0;
+        for (const [c, methods] of byConn) {
+            i++;
+            try {
+                await rpcCall('egress.permissions.connector', { connector: c, methods });
+                changed.push(...Object.keys(methods).map((m) => `${c}.${m}`));
+            } catch (e) {
+                failed.push({ connector: c, error: (e && e.message) || String(e) });
+            }
+            if (i < byConn.size) await new Promise((r) => setTimeout(r, delayMs));
+        }
+        invalidateRpcCtx();
+        console.log(TAG, `✓ 已修改 ${changed.length} 个，失败 ${failed.length} 个`);
+        return { changed, failed };
+    }
+
+    // 修复 v2.3.0 遗留：默认启用 RISKY 过滤保护高危项，传 includeRisky: true 才全改
+    async function allowEverything({ confirm = false, includeRisky = false } = {}) {
+        const rows = (await listConnectors()).filter((r) => r.mode === 'ask');
+        const can = [];
+        const cannot = [];
+        for (const r of rows) {
+            const opts = r.canSet ? r.canSet.split('/') : null;
+            if (opts && !opts.includes('allow')) cannot.push(r);
+            else can.push(r);
+        }
+        const target = includeRisky ? can : exclude(can, [RISKY]);
+        const skippedRisky = can.length - target.length;
+        console.log(
+            TAG,
+            `共 ${rows.length} 个 ask 项：本次处理 ${target.length}` +
+            (skippedRisky ? `，已跳过高危 ${skippedRisky}（传 includeRisky:true 可包含）` : '') +
+            `，服务端限制不可改 ${cannot.length}`
+        );
+        return applyList(target.map((r) => ({ connector: r.connector, method: r.method })), { confirm });
+    }
+
+    async function approveNow({ decision = state.decision, alwaysScope, dryRun = false } = {}) {
+        domScan();
+        const list = pendingOf(await rpcCall('egress.approvals', {}));
+        const out = [];
+        for (const item of list) {
+            const id = idOf(item);
+            if (!id) continue;
+            if (dryRun) {
+                out.push({ id, title: titleOf(item), chain: buildDecisionChain(item, decision), dryRun: true });
+                continue;
+            }
+            try {
+                const res = await decideSmart(item, decision, { alwaysScope });
+                recordApproved('rpc', `${res.decision} · ${titleOf(item)}`);
+                out.push({ id, ok: true, decision: res.decision });
+            } catch (e) {
+                out.push({ id, ok: false, error: (e && e.message) || String(e) });
+            }
+        }
+        return out;
+    }
+
+    function diag() {
+        const readyCtx = findRpcCtx({ allowPending: false });
+        const pendingCtx = readyCtx || findRpcCtx({ allowPending: true });
+        const info = {
+            version: VERSION,
+            gen: myGen,
+            isOwner: isActiveGen(),
+            isTop,
+            enabled: state.enabled,
+            count: state.count,
+            rpcCount: state.rpcCount,
+            domCount: state.domCount,
+            rpcReady: G.rpcReady,
+            hasReadyCtx: !!readyCtx,
+            hasPendingCtx: !!pendingCtx,
+            connectionState: pendingCtx ? pendingCtx.connectionState : null,
+            activeShadows: getActiveShadowRoots().length,
+            inFlight: G.inFlight.size,
+        };
+        console.log(TAG, '诊断信息:', info);
+        return info;
+    }
+
+    // 清理本实例所有句柄（绝不触碰其他新实例）
+    function teardown() {
+        owned.destroyed = true;
+        if (owned.rpcTimer) { clearTimeout(owned.rpcTimer); owned.rpcTimer = null; }
+        if (owned.rpcWakeTimer) { clearTimeout(owned.rpcWakeTimer); owned.rpcWakeTimer = null; }
+        if (owned.domTimer) { clearInterval(owned.domTimer); owned.domTimer = null; }
+        if (owned.domThrottleTimer) { clearTimeout(owned.domThrottleTimer); owned.domThrottleTimer = null; }
+        if (owned.domDeferTimer) { clearTimeout(owned.domDeferTimer); owned.domDeferTimer = null; }
+        for (const obs of owned.observers) {
+            try { obs.disconnect(); } catch (e) {}
+        }
+        owned.observers.clear();
+        win.removeEventListener('message', onWindowMessage);
+        win.removeEventListener('storage', onStorageSync);
+        win.removeEventListener('resize', onResize);
+    }
+
+    G.activeTeardown = teardown;
+
+    // 导出控制台 API（与 v2.3.0 兼容）
+    if (isTop) {
+        win.__musePerm = {
+            version: VERSION,
+            setEnabled,
+            enable: () => setEnabled(true),
+            disable: () => setEnabled(false),
+            stopAuto: () => setEnabled(false),
+            autoApprove: () => setEnabled(true),
+            autoStart: (on) => setEnabled(on),
+            approveNow,
+            scanDom: domScan,
+            get: getPermissions,
+            approvals: listApprovals,
+            connectors: listConnectors,
+            asking: listAsking,
+            decide: decideRaw,
+            decideSmart,
+            connector: setConnector,
+            applyList,
+            allowEverything,
+            exclude,
+            RISKY,
+            on: () => rpcCall('egress.permissions.hitl', { mode: 'full' }),
+            clearSnooze: () => rpcCall('egress.permissions.hitl.snooze.delete', {}),
+            raw: (m, p) => rpcCall(m, p),
+            findRpcCtx,
+            diag,
+            get rpcLog() { return G.rpcLog; },
+            get domLog() { return G.domLog; },
+            get running() { return state.enabled; },
+            get gen() { return myGen; },
+        };
+    }
+
+    // =========================================================================
+    // 启动入口
+    // =========================================================================
+
+    function boot() {
+        if (!isActiveGen()) return;
+        win.addEventListener('message', onWindowMessage);
+        win.addEventListener('storage', onStorageSync);
+        if (isTop) win.addEventListener('resize', onResize);
+
+        if (isTop) {
+            renderBadge();
+            if (!G.bannerShown) {
+                G.bannerShown = true;
+                console.log(TAG, `v${VERSION} 已加载（RPC直通 + DOM穿透精点双引擎）`);
+            }
+        }
+
+        // 挂载 DOM 监听与低频兜底巡检
+        attachObserver(doc.body || doc.documentElement);
+        for (const sr of getActiveShadowRoots()) attachObserver(sr);
+        domScan();
+        owned.domTimer = setInterval(domScan, state.domIntervalMs || 1200);
+
+        // 顶层启动 RPC 串行轮询（自动等待真实就绪与断连自愈）
+        if (isTop) {
+            owned.rpcTimer = setTimeout(rpcTick, 800);
+        }
+    }
+
+    if (doc.readyState === 'loading') {
+        doc.addEventListener('DOMContentLoaded', boot, { once: true });
+    } else {
+        boot();
+    }
 })();

@@ -11,11 +11,11 @@
 <p align="center">
   <b>Automated permission approval tool designed specifically for <a href="https://muse.ai">Muse.ai</a></b><br>
   Dual-mode support: Native Chrome Extension (Manifest V3) + Tampermonkey Userscript<br>
-  Closed Shadow DOM bypass · Deep iframe sandbox traversal · Synthetic event dispatch · Draggable floating badge
+  Direct RPC Engine · Closed Shadow DOM & iframe Penetration · Context-Aware Anti-Misclick · Verified Counting · Draggable Badge
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-6.4-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-7.0.0-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -33,29 +33,28 @@ Automatically detects permission dialogs on Muse (file uploads, tool executions,
 
 ## Key Features
 
-- **Closed Shadow DOM Penetration**  
-  Hooks `Element.prototype.attachShadow` at the `document-start` lifecycle stage, downgrading closed shadow roots to `open` mode to penetrate modern Web Component encapsulations.
+- **Dual-Engine Coordination (Direct RPC + DOM Penetration)**  
+  Extracts Muse's `HatchRpc` context via React Fiber to silently approve `egress.approvals` in-flight, while the DOM penetration engine handles client-only cards (file uploads, public links, etc.) with smart RPC handoff to prevent duplicate triggers.
 
-- **Deep Iframe Sandbox Traversal & Cross-Window Broadcasting**  
-  Recursively traverses the main document and all same-origin nested iframes. Approval actions triggered inside child frames are safely broadcast to the top window via `postMessage` for unified count synchronization.
+- **Strict Tier Priority (Always / All First, Single Fallback)**  
+  RPC prioritizes `allow_always` and automatically degrades to `allow_once` when server policy forbids permanent approval. DOM clicking ranks buttons across 4 tiers (`Allow all` / `Always allow all` > `Allow always` / `Always allow` > `Allow all once` > `Allow` / `Approve`) and normalizes badge counts like `Allow all (3)`.
 
-- **Synthetic Event Chain & Direct React Handler Execution**  
-  Dispatches a full event sequence (`pointerdown` -> `mousedown` -> `pointerup` -> `mouseup` -> `click`) and directly invokes React internal `onClick` handlers via `__reactProps$` / `__reactEventHandlers$` to prevent ghost clicks or missed triggers.
+- **Context-Aware Anti-Misclick Protection**  
+  Verifies approval context (paired Deny/Reject/Cancel buttons or approval prompts) before clicking and excludes navigation bars, code blocks, settings switches, and disabled buttons.
 
-- **Intelligent Batch-First Decision Strategy**  
-  Prioritizes batch approval buttons (`Allow all once`, `Allow all`, `Always allow`, `全部允许一次`, `全部允许`) over single-action buttons (`Allow`, `Approve`, `允许`), maximizing multi-task throughput.
+- **Verified Approval Counting & Smart Retry**  
+  Counts only after RPC confirmation or verified DOM button state transitions (detached, hidden, disabled, or label changed), escalating to direct React `onClick` invocation only on retry.
 
-- **Dual Debounce & WeakMap Cooldown Lock**  
-  Implements a per-element 1500ms cooldown via `WeakMap` alongside a 500ms global throttle to prevent aggressive loops caused by rapid DOM re-renders.
+- **Closed Shadow DOM Penetration Without Leaks**  
+  Patches `Element.prototype.attachShadow` at `document-start`, tracks roots with `WeakRef` for GC safety, and uses throttled `MutationObserver` instead of heavy full-DOM polling.
+
+- **Multi-Instance Guard & Strict Domain Isolation**  
+  Uses generation tokens to prevent duplicate execution across reloads, enforces exact `muse.ai` / `*.muse.ai` hostname checks, and migrates legacy v6.3/v6.4 settings automatically.
 
 - **Minimalist Draggable Floating Badge**  
-  - **Drag & Reposition**: Move the badge anywhere on screen; coordinates are automatically persisted in `localStorage` across page reloads.
-  - **Left Click**: Seamlessly toggle between Auto and Paused states.
-  - **Right Click**: Reset approval counter to zero.
-  - **Visual Design**: Frosted glass backdrop with dynamic indicator dot; compact footprint that never obstructs your workspace.
-
-- **Strict Domain Scope Isolation (Zero Third-Party Interference)**  
-  Matches exclusively on `muse.ai` domains. Completely eliminates wildcard `@match *://*/*` injection, ensuring zero interference with Cloudflare (Turnstile) bot verification and preventing accidental authorizations on external platforms like GitHub or Discord.
+  - **Drag & Reposition**: Move anywhere on screen with persisted coordinates.
+  - **Left Click**: Toggle Auto / Paused across main page and child iframes.
+  - **Right Click**: Reset cumulative approval counters.
 
 ---
 

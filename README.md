@@ -11,11 +11,11 @@
 <p align="center">
   <b>专为 <a href="https://muse.ai">Muse.ai</a> 打造的自动化权限审批工具</b><br>
   双模支持：Chrome 原生扩展 (Manifest V3) + 油猴用户脚本 (Tampermonkey)<br>
-  穿透封闭组件 · 穿透 iframe 沙盒 · 真实合成事件流 · 迷你拖拽记忆胶囊
+  RPC 静默直通 · 穿透封闭组件与 iframe · 审批上下文防误点 · 验成败真实计数 · 迷你拖拽记忆胶囊
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-6.4-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-7.0.0-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -33,29 +33,29 @@
 
 ## 核心特性
 
-- **Closed Shadow DOM 穿透**  
-  在 `document-start` 极早生命周期重写 `Element.prototype.attachShadow`，将封闭模式降解为 `open`，穿透现代前端框架的 Web Component 封装。
+- **双引擎协同（RPC 静默直通 + DOM 穿透精点）**  
+  自动提取页面 React Fiber 中的 `HatchRpc` 通道，后台直接应答 `egress.approvals` 待审批列表；遇到不走 RPC 的前端弹窗（如文件上传、创建公开链接等），DOM 穿透引擎礼让防撞后自动接管点击，两路无缝互补。
 
-- **全层级 Iframe 沙盒遍历与跨窗口广播**  
-  深度递归主文档及所有同源嵌套 iframe；子窗口触发审批后，通过安全 `postMessage` 实时通知顶层窗口更新统计。
+- **严格档位优先（全部 / 永久允许优先，降级兜底单个允许）**  
+  RPC 侧默认先发 `allow_always`（永久允许），遇到服务端限制仅允许单次的项目自动降级为 `allow_once`；页面点击侧支持四级档位排序（`全部允许 / 全部永久允许` > `永久允许 / 始终允许 / Allow always / Always allow` > `全部允许一次` > `允许 / Allow / Approve`），自动剥离按钮角标数字（如 `全部允许 (3)`）。
 
-- **真实合成事件链 + React Props 直击**  
-  不仅完整派发 `pointerdown` -> `mousedown` -> `pointerup` -> `mouseup` -> `click` 全流程事件，更直接调用 React 内部属性（`__reactProps$` / `__reactEventHandlers$`）的 `onClick` 处理函数，杜绝假点击与漏点击。
+- **审批上下文强校验（根治误点）**  
+  不再盲点全页任意“允许 / Allow / Approve”按钮；仅对包含配对拒绝/取消按钮或明确审批提示语的确认卡片动手，自动跳过导航栏、代码块、设置开关及禁用按钮。
 
-- **智能批量优先裁决**  
-  优先匹配并点击 `全部允许一次` / `全部允许` / `始终允许` / `Allow all` 等批量选项，其次回落到单次 `允许` / `批准`，最大化加速多任务并发流转。
+- **验成败真实计数与破冰重试**  
+  RPC 必须拿到服务端成功确认才计次；页面点击采用延迟验收（确认按钮消失、禁用或状态变更才 `+1`），点击未生效时不虚增计数，下一轮自动升级为 React `onClick` 直击破冰。
 
-- **双重防抖与弱引用冷却锁**  
-  使用 `WeakMap` 为每个按钮设置 1500ms 独立冷却时间，结合 500ms 全局节流，避免高频 DOM 重绘引发的暴力连击与请求风暴。
+- **Closed Shadow DOM 穿透与零内存泄漏**  
+  在 `document-start` 极早生命周期重写 `Element.prototype.attachShadow`，配合 `WeakRef` 自动回收已卸载的 ShadowRoot，并结合 `MutationObserver` 事件驱动扫描大幅降低 CPU 占用。
+
+- **多实例互斥与严格域名隔离**  
+  跨实例共享状态与代际号防止重复注入重批；主机名严格限定为 `muse.ai` 及 `*.muse.ai`，绝不干扰第三方站点；自动迁移旧版 v6.3/v6.4 的开关状态、计数与悬浮胶囊位置。
 
 - **极简可拖拽悬浮胶囊**  
   - **按住拖动**：自由放置在屏幕任意位置，自动持久化记忆坐标，页面刷新不丢失。
-  - **左键单击**：一键切换“自动运行 / 暂停”状态。
+  - **左键单击**：一键切换“自动运行 / 暂停”状态，并同步子 iframe。
   - **右键单击**：一键清零审批累计计数。
-  - **视觉体验**：毛玻璃磨砂质感与指示点，小巧不遮挡操作区。
-
-- **严格作用域隔离（零跨站干扰）**  
-  匹配规则严格限定在 `muse.ai` 域名下，彻底移除全网匹配。绝不在任何外部站点注入执行，杜绝因改写原型链破坏 Cloudflare (Turnstile) 人机验证组件，彻底消除在 GitHub / Discord 等第三方平台误点授权的隐患。
+  - **状态可视**：直观区分“双擎（RPC已连）”与“点控（DOM值守）”，悬停可看直通/点击明细。
 
 ---
 

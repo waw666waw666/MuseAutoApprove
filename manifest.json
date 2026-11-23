@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Muse 自动审批助手",
-  "version": "6.4.1",
-  "description": "智能穿透 Closed Shadow DOM 与 iframe 沙盒，全自动审批 Muse.ai 助手权限，支持迷你可拖拽悬浮窗",
+  "version": "7.0.0",
+  "description": "RPC 静默直通 + Closed Shadow DOM/iframe 穿透双擎协同，全自动审批 Muse.ai 助手权限，防误点与真实计数",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -29,6 +29,7 @@
       ],
       "js": ["content.js"],
       "run_at": "document_start",
+      "world": "MAIN",
       "all_frames": true,
       "match_about_blank": true
     }
