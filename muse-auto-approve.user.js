@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Muse 自动审批 (经典穿透 + 迷你拖拽融合版)
 // @namespace    https://github.com/waw666waw666/MuseAutoApprove
-// @version      7.0.3
+// @version      7.0.4
 // @description  协议优先双引擎（RPC主动查单为主 + Closed Shadow DOM/iframe穿透兜底）：优先全部/永久允许，审批上下文防误点，验成败真实计数，原版迷你可拖拽胶囊与悬停详情
 // @author       waw666waw666
 // @match        *://muse.ai/*
@@ -17,7 +17,7 @@
     'use strict';
 
     // 免责声明：本脚本仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.0.3';
+    const VERSION = '7.0.4';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -772,11 +772,11 @@
         return v.connectionState === 'connected';
     }
 
-    function invalidateRpcCtx() {
+    function invalidateRpcCtx({ preserveReady = false } = {}) {
         G.ctx = null;
         G.scanRes = null;
         G.scanAt = 0;
-        if (G.rpcReady) {
+        if (!preserveReady && G.rpcReady) {
             G.rpcReady = false;
             renderBadge();
         }
@@ -1078,8 +1078,8 @@
                             invalidateRpcCtx();
                             readyCtx = findRpcCtx({ allowPending: false });
                         } catch (wakeErr) {
-                            G.rpcReady = false;
                             rpcConsecutiveFails++;
+                            if (rpcConsecutiveFails >= 2) G.rpcReady = false;
                             nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
                             reportRpcFailure('连不上', wakeErr, nextDelay);
                             return;
@@ -1088,8 +1088,8 @@
                 }
 
                 if (!readyCtx) {
-                    G.rpcReady = false;
                     rpcConsecutiveFails++;
+                    if (rpcConsecutiveFails >= 2) G.rpcReady = false;
                     nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
                     if (!pendingCtx) {
                         reportRpcFailure('连不上', '未找到 HatchRpc 通道（页面未进入工作区或 React 尚未挂载）', nextDelay);
@@ -1154,8 +1154,8 @@
                         console.warn(TAG, `✗ [协议批单失败:${cat} #${count}，${Math.round(backoff / 1000)}s后再试]`, id, msg);
                     }
                     if (isConnectionError(err)) {
-                        invalidateRpcCtx();
                         rpcConsecutiveFails++;
+                        invalidateRpcCtx({ preserveReady: rpcConsecutiveFails < 2 });
                         nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
                         reportRpcFailure('连不上', err, nextDelay);
                         break;
@@ -1167,12 +1167,16 @@
 
             pruneRpcMaps(activeIds);
         } catch (e) {
-            G.rpcReady = false;
             rpcConsecutiveFails++;
             nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
             const category = isAuthError(e) ? '没权限' : (isConnectionError(e) ? '连不上' : '接口报错');
             if (isConnectionError(e)) {
-                invalidateRpcCtx();
+                invalidateRpcCtx({ preserveReady: rpcConsecutiveFails < 2 });
+            } else if (findRpcCtx({ allowPending: false })) {
+                // 服务端/权限类响应不是传输断线；保持协议引擎在线，避免误触发页面点击兜底。
+                // 注意：这里不能调 markRpcHealthy()，它会清掉失败计数与报错去重，
+                // 导致退避永远停在第一档、同一报错的提示和日志每 1.5s 反复刷屏。
+                G.rpcReady = true;
             }
             reportRpcFailure(category, e, nextDelay);
         } finally {
@@ -1229,8 +1233,10 @@
     ]);
     const TIER2_EXACT = new Set([
         '永久允许', '始终允许', '总是允许', '一直允许', '永久批准', '始终批准', '一律放行',
-        '始终允许此网站', '始终允许此连接器',
-        'allow always', 'always allow', 'always allow this site', 'always allow this connector',
+        '总是允许此站点', '始终允许此站点', '总是允许此网站', '始终允许此网站',
+        '总是允许此连接器', '始终允许此连接器', '总是允许此域名', '始终允许此域名',
+        'allow always', 'always allow', 'always allow this site', 'always allow this website',
+        'always allow this domain', 'always allow this connector',
         'approve always', 'always approve', 'permit always', 'trust always',
     ]);
     const TIER3_EXACT = new Set([
@@ -1539,35 +1545,14 @@
     function dispatchClickChain(el, forceReactCallback = false) {
         if (!el) return;
         try {
-            const rect = el.getBoundingClientRect();
-            const clientX = rect.left + rect.width / 2;
-            const clientY = rect.top + rect.height / 2;
-            const opts = {
-                bubbles: true,
-                cancelable: true,
-                composed: true,
-                view: win,
-                clientX,
-                clientY,
-                button: 0,
-                buttons: 1,
-            };
-            try { el.dispatchEvent(new PointerEvent('pointerover', opts)); } catch (e) {}
-            try { el.dispatchEvent(new MouseEvent('mouseover', opts)); } catch (e) {}
-            try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (e) {}
-            try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch (e) {}
-            if (typeof el.focus === 'function') {
-                try { el.focus({ preventScroll: true }); } catch (e) {}
-            }
-            try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
-            try { el.dispatchEvent(new MouseEvent('mouseup', opts)); } catch (e) {}
+            // 直接触发元素 click，不模拟鼠标移动、按下或抬起事件。
             if (typeof el.click === 'function') {
                 el.click();
             } else {
-                el.dispatchEvent(new MouseEvent('click', opts));
+                el.dispatchEvent(new Event('click', { bubbles: true, cancelable: true }));
             }
 
-            // 仅在普通事件链未生效的重试破冰模式下，才追加直调 React onClick，避免单次点击双触发
+            // 仅在首次直接 click 未生效后的重试中，才追加 React onClick。
             if (forceReactCallback) {
                 for (const k of Object.keys(el)) {
                     if (k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$')) {
@@ -1578,7 +1563,7 @@
                                 currentTarget: el,
                                 preventDefault() {},
                                 stopPropagation() {},
-                                nativeEvent: new MouseEvent('click', opts),
+                                nativeEvent: new Event('click', { bubbles: true, cancelable: true }),
                             });
                             break;
                         }

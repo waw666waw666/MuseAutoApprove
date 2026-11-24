@@ -11,9 +11,9 @@ const MANIFEST = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.m
     const strippedUser = USER_JS.replace(/^\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\s*/, '')
         .replace('免责声明：本脚本', '免责声明：本扩展');
     assert.equal(strippedUser.trim(), CONTENT_JS.trim(), 'muse-auto-approve.user.js 与 content.js 主体必须一致');
-    assert.equal(MANIFEST.version, '7.0.3');
+    assert.equal(MANIFEST.version, '7.0.4');
     assert.equal(MANIFEST.content_scripts[0].world, 'MAIN');
-    assert.match(USER_JS, /@version\s+7\.0\.3/);
+    assert.match(USER_JS, /@version\s+7\.0\.4/);
     assert.match(USER_JS, /@grant\s+none/);
     assert.match(USER_JS, /@run-at\s+document-start/);
     console.log('[PASS] 0. 元数据、双模同步与 manifest.json 校验通过');
@@ -255,6 +255,7 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
             for (const fn of (listeners.get('message') || [])) fn({ origin, data });
         },
         PointerEvent: class PointerEvent { constructor(type, opts) { this.type = type; Object.assign(this, opts); } },
+        Event: class Event { constructor(type, opts) { this.type = type; Object.assign(this, opts || {}); } },
         MouseEvent: class MouseEvent { constructor(type, opts) { this.type = type; Object.assign(this, opts); } },
         MutationObserver: class MutationObserver {
             constructor(cb) { this.cb = cb; this.disconnected = false; }
@@ -828,8 +829,9 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     await env.advance(20_200);
 
     const dFail = env.win.__musePerm.diag();
-    assert.equal(dFail.rpcReady, false, '接口报错后协议状态必须为未连接');
-    assert.equal(dFail.domFallbackActive, true, '协议失败时 DOM 兜底必须处于激活态');
+    // v7.0.4 新语义：权限类（403）响应不是传输断线，协议引擎保持在线，不因单类报错被打离线
+    assert.equal(dFail.rpcReady, true, 'v7.0.4：权限类报错后协议引擎应保持在线');
+    assert.equal(dFail.domFallbackActive, false, 'v7.0.4：协议保持在线时 DOM 兜底不处于激活态（出卡时仍会礼让 450ms 后接管）');
     assert.equal(dFail.rpcLastError.category, '没权限', '403 必须准确归类为「没权限」');
     assert.match(dFail.rpcLastError.raw, /403 permission denied: egress token expired/, '必须保留接口报错原文');
 
@@ -845,14 +847,14 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     // 验证原版胶囊：收起态依然小巧（只含「自动 + 数字」），小圆点变柔琥珀色指示未连，悬停写明失败原因
     const badge = env.document.getElementById('muse-aa-badge-v7');
     assert.equal(badge.textContent, '自动0', '协议未连时收起态仍保持原版迷你大小不撑大');
-    assert.equal(badge.children[0].style.background, '#fde68a', '协议未连时小圆点切换为琥珀指示');
-    assert.match(badge.title, /403 permission denied: egress token expired/, '胶囊悬停必须写明失败原因');
+    assert.equal(badge.children[0].style.background, '#a7f3d0', 'v7.0.4：权限类报错保持在线，小圆点仍为薄荷绿');
+    assert.match(badge.title, /协议已连接/, 'v7.0.4：保持在线时胶囊悬停显示已连接（具体报错看 diag.rpcLastError 与日志）');
 
     // 悬停详情面板同样展示未连接状态与具体失败原因
     badge.dispatchEvent(new env.win.PointerEvent('pointerenter', {}));
     const detailFail = env.document.getElementById('muse-aa-detail-v7');
-    assert.match(detailFail.textContent, /协议状态：未连接/, '详情面板必须显示未连接');
-    assert.match(detailFail.textContent, /403 permission denied: egress token expired/, '详情面板必须显示报错原因');
+    assert.match(detailFail.textContent, /协议状态：已连接/, 'v7.0.4：详情面板显示保持在线');
+    assert.equal(dFail.rpcLastError.raw, '403 permission denied: egress token expired', '报错原文保留在 diag 中可查');
 
     // 此时页面出现审批卡片（同时带 Tier2「始终允许此网站」与 Tier5「允许」），DOM 第二引擎必须立刻 0 礼让兜底并按 7.0.1 五档优先点 Tier2！
     const card = env.document.createElement('div');
@@ -869,8 +871,8 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     env.body.appendChild(card);
 
     env.win.__musePerm.scanDom();
-    await env.advance(300);
-    assert.equal(siteAlwaysBtn.clickCount, 1, '协议失败时 DOM 第二引擎必须零延迟接管并按五档优先点「始终允许此网站」');
+    await env.advance(900);
+    assert.equal(siteAlwaysBtn.clickCount, 1, 'v7.0.4：协议保持在线时 DOM 第二引擎礼让 450ms 后接管，并按五档优先点「始终允许此网站」');
     assert.equal(singleBtn.clickCount, 0);
     assert.equal(env.win.__musePerm.diag().domCount, 1);
 
