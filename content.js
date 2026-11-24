@@ -2,7 +2,7 @@
     'use strict';
 
     // 免责声明：本扩展仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.0.4';
+    const VERSION = '7.0.6';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -38,6 +38,11 @@
         domLog: [],
         bannerShown: false,
     });
+
+    // 与旧版共享全局对象时也补齐连接中状态字段。
+    if (typeof G.rpcConnecting !== 'boolean') G.rpcConnecting = false;
+    if (typeof G.rpcConnectingSince !== 'number') G.rpcConnectingSince = 0;
+    if (typeof G.rpcReconnectAttempts !== 'number') G.rpcReconnectAttempts = 0;
 
     // 若旧实例仍在运行，优雅清理旧实例自己的句柄（不破坏新实例）
     if (typeof G.activeTeardown === 'function') {
@@ -236,7 +241,7 @@
 
         const rows = [
             `Muse 自动审批 v${VERSION}（${on ? '运行中' : '已暂停'}）`,
-            `协议状态：${rpcOnline ? '已连接（第一引擎主动查单）' : '未连接（页面兜底中）'}`,
+            `协议状态：${G.rpcConnecting ? '连接中（等待协议恢复，暂不点击页面）' : (rpcOnline ? '已连接（第一引擎主动查单）' : '未连接（页面兜底中）')}`,
             `最近协议批单：${lastRpcLine}`,
             `累计批掉：${state.count} 次（协议 ${state.rpcCount} / 兜底 ${state.domCount}）`,
             `最近动作：${lastActionSummary}`,
@@ -529,16 +534,18 @@
             ? '1px solid rgba(167, 243, 208, 0.35)'
             : '1px solid rgba(156, 163, 175, 0.25)';
 
-        refs.dotEl.style.background = on ? (rpcOnline ? '#a7f3d0' : '#fde68a') : '#9ca3af';
+        refs.dotEl.style.background = on ? (rpcOnline ? '#a7f3d0' : (G.rpcConnecting ? '#93c5fd' : '#fde68a')) : '#9ca3af';
         refs.dotEl.style.boxShadow = on
-            ? (rpcOnline ? '0 0 4px #a7f3d0' : '0 0 4px #fde68a')
+            ? (rpcOnline ? '0 0 4px #a7f3d0' : (G.rpcConnecting ? '0 0 4px #93c5fd' : '0 0 4px #fde68a'))
             : 'none';
         refs.labelEl.textContent = on ? '自动' : '暂停';
         refs.countEl.textContent = String(state.count);
 
-        const rpcStateLine = rpcOnline
-            ? '协议已连接（第一引擎主动查单中）'
-            : `协议未连接（${G.rpcStatusReason || '等待重连'}；DOM 第二引擎兜底中）`;
+        const rpcStateLine = G.rpcConnecting
+            ? '协议连接中（等待恢复，暂不使用页面兜底）'
+            : (rpcOnline
+                ? '协议已连接（第一引擎主动查单中）'
+                : `协议未连接（${G.rpcStatusReason || '等待重连'}；DOM 第二引擎兜底中）`);
         const lastRpcLine = lastRpcClock
             ? `${lastRpcClock}${state.lastRpcApprovedLabel ? ' · ' + state.lastRpcApprovedLabel : ''}`
             : '暂无';
@@ -1011,6 +1018,9 @@
     function markRpcHealthy() {
         const wasOffline = !G.rpcReady || rpcConsecutiveFails > 0;
         rpcConsecutiveFails = 0;
+        G.rpcConnecting = false;
+        G.rpcConnectingSince = 0;
+        G.rpcReconnectAttempts = 0;
         rpcLastLogKey = '';
         rpcSameErrCount = 0;
         G.rpcLastError = null;
@@ -1048,9 +1058,68 @@
 
             // 第一步：获取真正就绪的协议通道（无 DOM 卡也独立持续查询）
             let readyCtx = findRpcCtx({ allowPending: false });
+            if (readyCtx) {
+                G.rpcConnecting = false;
+                G.rpcConnectingSince = 0;
+                G.rpcReconnectAttempts = 0;
+            }
             if (!readyCtx) {
                 const pendingCtx = findRpcCtx({ allowPending: true });
                 const now = Date.now();
+                const connectionState = String((pendingCtx && pendingCtx.connectionState) || '').toLowerCase();
+                const isConnecting = connectionState === 'connecting' || connectionState === 'reconnecting';
+
+                // isReady=false 且 connectionState=connecting 是握手过程，不是断线；先等 15 秒，再有限次数主动拉活。
+                if (isConnecting) {
+                    if (!G.rpcConnectingSince) {
+                        G.rpcConnectingSince = now;
+                        G.rpcReconnectAttempts = 0;
+                    }
+                    const waited = now - G.rpcConnectingSince;
+                    if (waited < 15000) {
+                        G.rpcConnecting = true;
+                        G.rpcStatusReason = '协议通道连接中，等待握手完成';
+                        nextDelay = 1000;
+                        renderBadge();
+                        return;
+                    }
+
+                    if (pendingCtx && typeof pendingCtx.ensureLiveConnection === 'function' &&
+                        G.rpcReconnectAttempts < 2 && now - lastEnsureConnAt >= 5000) {
+                        G.rpcReconnectAttempts++;
+                        lastEnsureConnAt = now;
+                        G.rpcConnecting = true;
+                        G.rpcStatusReason = `协议握手超时，尝试恢复 ${G.rpcReconnectAttempts}/2`;
+                        nextDelay = 1000;
+                        renderBadge();
+                        let wakeTimer = null;
+                        try {
+                            await Promise.race([
+                                Promise.resolve().then(() => pendingCtx.ensureLiveConnection()),
+                                new Promise((_, reject) => {
+                                    wakeTimer = setTimeout(() => reject(new Error('ensureLiveConnection 等待超时')), 4000);
+                                }),
+                            ]);
+                        } catch (wakeErr) {
+                            console.warn(TAG, `协议恢复尝试 ${G.rpcReconnectAttempts}/2 未完成：`, wakeErr);
+                        } finally {
+                            if (wakeTimer) clearTimeout(wakeTimer);
+                        }
+                        invalidateRpcCtx({ preserveReady: true });
+                        G.rpcConnectingSince = Date.now();
+                        return;
+                    }
+
+                    G.rpcConnecting = false;
+                    G.rpcReady = false;
+                    rpcConsecutiveFails = Math.max(rpcConsecutiveFails, 2);
+                    G.rpcStatusReason = '协议通道连接超时';
+                    renderBadge();
+                } else {
+                    G.rpcConnecting = false;
+                    G.rpcConnectingSince = 0;
+                    G.rpcReconnectAttempts = 0;
+                }
 
                 // 若通道处于断开/休眠状态，按退避节奏主动调用 ensureLiveConnection() 拉活，但绝不对 connecting 状态盲发请求
                 if (pendingCtx && typeof pendingCtx.ensureLiveConnection === 'function') {
@@ -1160,7 +1229,7 @@
             } else if (findRpcCtx({ allowPending: false })) {
                 // 服务端/权限类响应不是传输断线；保持协议引擎在线，避免误触发页面点击兜底。
                 // 注意：这里不能调 markRpcHealthy()，它会清掉失败计数与报错去重，
-                // 导致退避永远停在第一档、同一报错的提示和日志每 1.5s 反复刷屏。
+                // 导致退避永远停在第一档、同一报错的提示和日志每 1.5s 反复刷屏（v7.0.4 已修，勿回退）。
                 G.rpcReady = true;
             }
             reportRpcFailure(category, e, nextDelay);
@@ -1609,6 +1678,17 @@
             renderBadge();
         }
         if (!state.enabled) return;
+
+        // 协议正在握手时暂停页面点击，避免把正常连接过程误判为故障并触发兜底。
+        if (isTop && G.rpcConnecting) {
+            if (!owned.domDeferTimer) {
+                owned.domDeferTimer = setTimeout(() => {
+                    owned.domDeferTimer = null;
+                    domScan();
+                }, 1000);
+            }
+            return;
+        }
 
         const now = Date.now();
         if (now - lastDomClickAt < 420) return;
