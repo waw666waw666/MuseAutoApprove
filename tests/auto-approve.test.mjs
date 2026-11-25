@@ -11,9 +11,9 @@ const MANIFEST = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.m
     const strippedUser = USER_JS.replace(/^\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\s*/, '')
         .replace('免责声明：本脚本', '免责声明：本扩展');
     assert.equal(strippedUser.trim(), CONTENT_JS.trim(), 'muse-auto-approve.user.js 与 content.js 主体必须一致');
-    assert.equal(MANIFEST.version, '7.0.7');
+    assert.equal(MANIFEST.version, '7.0.8');
     assert.equal(MANIFEST.content_scripts[0].world, 'MAIN');
-    assert.match(USER_JS, /@version\s+7\.0\.7/);
+    assert.match(USER_JS, /@version\s+7\.0\.8/);
     assert.match(USER_JS, /@grant\s+none/);
     assert.match(USER_JS, /@run-at\s+document-start/);
     console.log('[PASS] 0. 元数据、双模同步与 manifest.json 校验通过');
@@ -381,6 +381,7 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     assert.equal(alwaysSiteBtn.clickCount, 0);
     assert.equal(batchOnceBtn.clickCount, 0);
 
+    await env.advance(3800); // v7.0.8：无 RPC 上下文先过 5 秒挂载宽限（期间暂停点击），宽限后继续后面的轮次
     // 第 2~4 轮：Tier 2 永久/始终类（始终允许此网站 / 始终允许此连接器 / Always allow this site）全部排在「全部允许一次」之前！
     await env.advance(1300);
     assert.equal(alwaysSiteBtn.clickCount, 1, '第 2 轮必须先选 Tier 2：始终允许此网站（先于全部允许一次）');
@@ -463,6 +464,7 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     const env = createEnv();
     env.runScript();
 
+    await env.advance(5200); // v7.0.8：先过无 RPC 上下文的 5 秒挂载宽限，再验 DOM 穿透点击
     const host = env.document.createElement('div');
     env.body.appendChild(host);
     const sr = host.attachShadow({ mode: 'closed' });
@@ -829,9 +831,9 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     await env.advance(20_200);
 
     const dFail = env.win.__musePerm.diag();
-    // v7.0.7 新语义：权限类（403）响应不是传输断线，协议引擎保持在线，不因单类报错被打离线
-    assert.equal(dFail.rpcReady, true, 'v7.0.7：权限类报错后协议引擎应保持在线');
-    assert.equal(dFail.domFallbackActive, false, 'v7.0.7：协议保持在线时 DOM 兜底不处于激活态（出卡时仍会礼让 450ms 后接管）');
+    // v7.0.8 新语义：权限类（403）响应不是传输断线，协议引擎保持在线，不因单类报错被打离线
+    assert.equal(dFail.rpcReady, true, 'v7.0.8：权限类报错后协议引擎应保持在线');
+    assert.equal(dFail.domFallbackActive, false, 'v7.0.8：协议保持在线时 DOM 兜底不处于激活态（出卡时仍会礼让 450ms 后接管）');
     assert.equal(dFail.rpcLastError.category, '没权限', '403 必须准确归类为「没权限」');
     assert.match(dFail.rpcLastError.raw, /403 permission denied: egress token expired/, '必须保留接口报错原文');
 
@@ -847,13 +849,13 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     // 验证原版胶囊：收起态依然小巧（只含「自动 + 数字」），小圆点变柔琥珀色指示未连，悬停写明失败原因
     const badge = env.document.getElementById('muse-aa-badge-v7');
     assert.equal(badge.textContent, '自动0', '协议未连时收起态仍保持原版迷你大小不撑大');
-    assert.equal(badge.children[0].style.background, '#a7f3d0', 'v7.0.7：权限类报错保持在线，小圆点仍为薄荷绿');
-    assert.match(badge.title, /协议已连接/, 'v7.0.7：保持在线时胶囊悬停显示已连接（具体报错看 diag.rpcLastError 与日志）');
+    assert.equal(badge.children[0].style.background, '#a7f3d0', 'v7.0.8：权限类报错保持在线，小圆点仍为薄荷绿');
+    assert.match(badge.title, /协议已连接/, 'v7.0.8：保持在线时胶囊悬停显示已连接（具体报错看 diag.rpcLastError 与日志）');
 
     // 悬停详情面板同样展示未连接状态与具体失败原因
     badge.dispatchEvent(new env.win.PointerEvent('pointerenter', {}));
     const detailFail = env.document.getElementById('muse-aa-detail-v7');
-    assert.match(detailFail.textContent, /协议状态：已连接/, 'v7.0.7：详情面板显示保持在线');
+    assert.match(detailFail.textContent, /协议状态：已连接/, 'v7.0.8：详情面板显示保持在线');
     assert.equal(dFail.rpcLastError.raw, '403 permission denied: egress token expired', '报错原文保留在 diag 中可查');
 
     // 此时页面出现审批卡片（同时带 Tier2「始终允许此网站」与 Tier5「允许」），DOM 第二引擎必须立刻 0 礼让兜底并按 7.0.1 五档优先点 Tier2！
@@ -872,7 +874,7 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
 
     env.win.__musePerm.scanDom();
     await env.advance(900);
-    assert.equal(siteAlwaysBtn.clickCount, 1, 'v7.0.7：协议保持在线时 DOM 第二引擎礼让 450ms 后接管，并按五档优先点「始终允许此网站」');
+    assert.equal(siteAlwaysBtn.clickCount, 1, 'v7.0.8：协议保持在线时 DOM 第二引擎礼让 450ms 后接管，并按五档优先点「始终允许此网站」');
     assert.equal(singleBtn.clickCount, 0);
     assert.equal(env.win.__musePerm.diag().domCount, 1);
 

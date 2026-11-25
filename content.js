@@ -2,7 +2,7 @@
     'use strict';
 
     // 免责声明：本扩展仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.0.7';
+    const VERSION = '7.0.8';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -43,6 +43,7 @@
     if (typeof G.rpcConnecting !== 'boolean') G.rpcConnecting = false;
     if (typeof G.rpcConnectingSince !== 'number') G.rpcConnectingSince = 0;
     if (typeof G.rpcReconnectAttempts !== 'number') G.rpcReconnectAttempts = 0;
+    if (typeof G.rpcMissingSince !== 'number') G.rpcMissingSince = 0;
 
     // 若旧实例仍在运行，优雅清理旧实例自己的句柄（不破坏新实例）
     if (typeof G.activeTeardown === 'function') {
@@ -1021,6 +1022,7 @@
         G.rpcConnecting = false;
         G.rpcConnectingSince = 0;
         G.rpcReconnectAttempts = 0;
+        G.rpcMissingSince = 0;
         rpcLastLogKey = '';
         rpcSameErrCount = 0;
         G.rpcLastError = null;
@@ -1062,10 +1064,25 @@
                 G.rpcConnecting = false;
                 G.rpcConnectingSince = 0;
                 G.rpcReconnectAttempts = 0;
+                G.rpcMissingSince = 0;
             }
             if (!readyCtx) {
                 const pendingCtx = findRpcCtx({ allowPending: true });
                 const now = Date.now();
+                if (!pendingCtx) {
+                    if (!G.rpcMissingSince) G.rpcMissingSince = now;
+                    const missingFor = now - G.rpcMissingSince;
+                    if (missingFor < 5000) {
+                        // React/工作区短暂卸载或尚未挂载时，先重扫，不立即误切到页面点击。
+                        G.rpcConnecting = true;
+                        G.rpcStatusReason = `等待 HatchRpc 上下文挂载（${Math.ceil((5000 - missingFor) / 1000)} 秒宽限）`;
+                        nextDelay = 1000;
+                        renderBadge();
+                        return;
+                    }
+                } else {
+                    G.rpcMissingSince = 0;
+                }
                 const connectionState = String((pendingCtx && pendingCtx.connectionState) || '').toLowerCase();
                 const isConnecting = connectionState === 'connecting' || connectionState === 'reconnecting';
 
@@ -1935,6 +1952,7 @@
             rpcStatus: G.rpcReady ? 'connected' : 'disconnected',
             rpcStatusReason: G.rpcStatusReason,
             rpcLastError: G.rpcLastError,
+            rpcContextMissingMs: G.rpcMissingSince ? Math.max(0, Date.now() - G.rpcMissingSince) : 0,
             lastRpcApprovedAt: state.lastRpcApprovedAt,
             lastRpcApprovedTime: formatClockTime(state.lastRpcApprovedAt) || null,
             domFallbackActive: state.enabled && !G.rpcReady,
