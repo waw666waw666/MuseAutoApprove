@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Muse 自动审批 (经典穿透 + 迷你拖拽融合版)
 // @namespace    https://github.com/waw666waw666/MuseAutoApprove
-// @version      7.0.8
-// @description  协议优先双引擎（RPC主动查单为主 + Closed Shadow DOM/iframe穿透兜底）：优先全部/永久允许，审批上下文防误点，验成败真实计数，原版迷你可拖拽胶囊与悬停详情
+// @version      7.1.0
+// @description  协议优先自动审批：RPC优先、保守降级、无鼠标模拟，带请求超时与暂停调度
 // @author       waw666waw666
 // @match        *://muse.ai/*
 // @match        *://*.muse.ai/*
@@ -17,7 +17,7 @@
     'use strict';
 
     // 免责声明：本脚本仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.0.8';
+    const VERSION = '7.1.0';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -59,20 +59,24 @@
     if (typeof G.rpcConnectingSince !== 'number') G.rpcConnectingSince = 0;
     if (typeof G.rpcReconnectAttempts !== 'number') G.rpcReconnectAttempts = 0;
     if (typeof G.rpcMissingSince !== 'number') G.rpcMissingSince = 0;
+    if (typeof G.rpcUncertainUntil !== 'number') G.rpcUncertainUntil = 0;
 
     // 若旧实例仍在运行，优雅清理旧实例自己的句柄（不破坏新实例）
     if (typeof G.activeTeardown === 'function') {
         try { G.activeTeardown(); } catch (e) {}
     }
     const myGen = ++G.gen;
+    let shadowHookOriginal = null;
+    let shadowHookPatched = null;
+    let shadowAttachedHook = null;
+    const previousShadowAttachedHook = G.onShadowAttached;
 
-    // 3. 极早劫持 Closed Shadow DOM（降级为 open，且用 WeakRef 防内存泄漏）
+    // 3. 捕获后续 ShadowRoot 引用，但保留页面声明的 open/closed 模式。
     const elemProto = win.Element && win.Element.prototype;
     if (elemProto && typeof elemProto.attachShadow === 'function' && !elemProto.attachShadow.__museAAHooked) {
         const origAttachShadow = elemProto.attachShadow;
         const patchedAttachShadow = function (init) {
-            const nextInit = (init && typeof init === 'object') ? { ...init, mode: 'open' } : { mode: 'open' };
-            const root = origAttachShadow.call(this, nextInit);
+            const root = origAttachShadow.call(this, init);
             try {
                 G.shadowRefs.add(typeof WeakRef !== 'undefined' ? new WeakRef(root) : root);
                 if (typeof G.onShadowAttached === 'function') G.onShadowAttached(root);
@@ -80,6 +84,9 @@
             return root;
         };
         patchedAttachShadow.__museAAHooked = true;
+        patchedAttachShadow.__museAAOwnerGen = myGen;
+        shadowHookOriginal = origAttachShadow;
+        shadowHookPatched = patchedAttachShadow;
         elemProto.attachShadow = patchedAttachShadow;
     }
 
@@ -134,6 +141,12 @@
     };
 
     const state = loadState();
+    const clampInterval = (value, fallback, min, max) => {
+        const n = Number(value);
+        return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
+    };
+    state.rpcIntervalMs = clampInterval(state.rpcIntervalMs, 1200, 900, 30000);
+    state.domIntervalMs = clampInterval(state.domIntervalMs, 1200, 800, 10000);
     let lastActionSummary = '待命中，自动监控审批';
 
     const saveState = () => {
@@ -160,10 +173,11 @@
         domTimer: null,
         domThrottleTimer: null,
         domDeferTimer: null,
+        domVerifyTimers: new Set(),
         toastTimer: null,
         detailHideTimer: null,
         observers: new Set(),
-        observedRoots: new WeakSet(),
+        observedRoots: new Set(),
         destroyed: false,
     };
 
@@ -627,7 +641,7 @@
             recordApproved(e.data.source === 'rpc' ? 'rpc' : 'dom', e.data.detail);
         } else if (e.data.type === 'MUSE_AA_SYNC' && !isTop && typeof e.data.enabled === 'boolean') {
             state.enabled = e.data.enabled;
-            if (state.enabled) scheduleDomScanSoon(80);
+            syncRuntimeEnabled();
         }
     };
 
@@ -637,6 +651,7 @@
             const next = JSON.parse(e.newValue);
             if (next && typeof next.enabled === 'boolean') {
                 state.enabled = next.enabled;
+                syncRuntimeEnabled();
                 if (isTop) {
                     if (typeof next.count === 'number') state.count = next.count;
                     if (typeof next.rpcCount === 'number') state.rpcCount = next.rpcCount;
@@ -833,6 +848,20 @@
         return key ? { expectedTargetKey: key } : {};
     }
 
+    function withTimeout(promise, timeoutMs, label) {
+        let timer = null;
+        const timeout = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+                const err = new Error(`${label} 超时（${timeoutMs}ms）`);
+                err.code = 'RPC_TIMEOUT';
+                reject(err);
+            }, timeoutMs);
+        });
+        return Promise.race([Promise.resolve(promise), timeout]).finally(() => {
+            if (timer) clearTimeout(timer);
+        });
+    }
+
     async function rpcCall(method, payload, opts) {
         let ctx = findRpcCtx({ allowPending: true });
         if (!ctx) {
@@ -840,7 +869,7 @@
         }
         if (!isUsableRpcCtx(ctx)) {
             if (typeof ctx.ensureLiveConnection === 'function') {
-                await ctx.ensureLiveConnection();
+                await withTimeout(Promise.resolve().then(() => ctx.ensureLiveConnection()), 6000, 'ensureLiveConnection');
             }
             const refreshed = findRpcCtx({ allowPending: true });
             if (refreshed) ctx = refreshed;
@@ -849,7 +878,12 @@
             throw new Error('HatchRpc is not ready');
         }
         const finalOpts = { ...getTargetOpts(ctx), ...(opts || {}) };
-        return ctx.sendRequest(method, payload ?? {}, finalOpts);
+        const timeoutMs = method === 'egress.approval.decide' ? 12000 : 8000;
+        return withTimeout(
+            Promise.resolve().then(() => ctx.sendRequest(method, payload ?? {}, finalOpts)),
+            timeoutMs,
+            method
+        );
     }
 
     function isConnectionError(err) {
@@ -866,6 +900,12 @@
         const msg = (err && err.message) ? err.message : String(err || '');
         if (isConnectionError(err)) return false;
         return /decision|allow_always|not allowed|unsupported|invalid|forbidden|cannot|only|400|bad request|disallowed|policy/i.test(msg);
+    }
+
+    function isDecisionUnsupportedError(err) {
+        if (!err || isConnectionError(err) || isAuthError(err)) return false;
+        const msg = (err.message || String(err)).toLowerCase();
+        return /unsupported decision|decision (is )?not supported|invalid decision|allow_always (is )?not supported|allow_always not allowed|永久允许.*不支持|不支持.*永久允许|不支持.*decision|不支持.*档位/i.test(msg);
     }
 
     function isRpcResultRejected(res) {
@@ -898,10 +938,9 @@
 
     // 档位选择链：严格优先永久/全部允许，服务端不允许时自动降级到单次允许
     function buildDecisionChain(approval, preferred = 'allow_always') {
-        const pref = preferred || 'allow_always';
-        const fallbackOrder = pref === 'allow_always'
-            ? ['allow_always', 'allow_once', 'allow']
-            : [pref, 'allow_always', 'allow_once', 'allow'];
+        const priority = ['allow_always', 'allow_once', 'allow'];
+        const pref = priority.includes(preferred) ? preferred : 'allow_always';
+        const fallbackOrder = priority.slice(priority.indexOf(pref));
 
         const rawOpts = approval && (
             approval.allowed_decisions ||
@@ -916,13 +955,11 @@
                 .map((x) => (typeof x === 'string' ? x : (x && (x.value || x.decision || x.id))))
                 .filter((x) => typeof x === 'string');
             if (norm.length) {
-                const priority = ['allow_always', 'always_allow', 'allow_all', 'allow_once', 'allow', 'approve'];
-                const matched = [];
-                if (norm.includes(pref)) matched.push(pref);
-                for (const p of priority) {
-                    if (norm.includes(p) && !matched.includes(p)) matched.push(p);
-                }
-                if (matched.length) return matched;
+                const aliases = { always_allow: 'allow_always', allow_all: 'allow_always', approve: 'allow' };
+                const supported = new Set(norm.map((x) => aliases[x] || x));
+                const maxIndex = priority.indexOf(pref);
+                const matched = priority.slice(Math.max(0, maxIndex)).filter((p) => supported.has(p));
+                return matched;
             }
         }
         return [...new Set(fallbackOrder)];
@@ -946,9 +983,9 @@
 
     async function decideSmart(approval, preferred = state.decision, opts = {}) {
         const approvalId = typeof approval === 'string' ? approval : idOf(approval);
-        const chain = typeof approval === 'string'
-            ? [...new Set([preferred || 'allow_always', 'allow_once', 'allow'])]
-            : buildDecisionChain(approval, preferred);
+        const chain = buildDecisionChain(typeof approval === 'string' ? null : approval, preferred);
+        if (!approvalId) throw new Error('缺少 approvalId');
+        if (!chain.length) throw new Error('服务端未提供可用的审批档位，未发送审批请求');
 
         let lastErr = null;
         for (let i = 0; i < chain.length; i++) {
@@ -958,19 +995,14 @@
                 return { ok: true, decision, res };
             } catch (e) {
                 lastErr = e;
-                // 连接异常：清缓存重扫后重试同一档位一次，绝不错误降级
+                // 传输失败/超时可能是“服务端已处理但响应丢失”：不盲目重放，交给下一轮查询协调。
                 if (isConnectionError(e)) {
                     invalidateRpcCtx();
-                    try {
-                        const res2 = await decideRaw(approvalId, decision, opts);
-                        return { ok: true, decision, res: res2 };
-                    } catch (e2) {
-                        throw e2;
-                    }
+                    throw e;
                 }
-                // 服务端明确不支持当前档位（如不能 allow_always）-> 自动降级到下一档
+                // 只在服务端明确表示当前档位不支持时，才尝试更窄权限档位。
                 const hasNext = i + 1 < chain.length;
-                if (hasNext && (decision === 'allow_always' || isDecisionRejectedError(e))) {
+                if (hasNext && isDecisionUnsupportedError(e)) {
                     continue;
                 }
                 throw e;
@@ -1129,14 +1161,20 @@
                             await Promise.race([
                                 Promise.resolve().then(() => pendingCtx.ensureLiveConnection()),
                                 new Promise((_, reject) => {
-                                    wakeTimer = setTimeout(() => reject(new Error('ensureLiveConnection 等待超时')), 4000);
+                                    wakeTimer = setTimeout(() => {
+                                        const err = new Error('ensureLiveConnection 等待超时');
+                                        err.code = 'RPC_TIMEOUT';
+                                        reject(err);
+                                    }, 4000);
                                 }),
                             ]);
                         } catch (wakeErr) {
                             console.warn(TAG, `协议恢复尝试 ${G.rpcReconnectAttempts}/2 未完成：`, wakeErr);
+                            if (wakeErr && wakeErr.code === 'RPC_TIMEOUT') nextDelay = Math.max(nextDelay, 15000);
                         } finally {
                             if (wakeTimer) clearTimeout(wakeTimer);
                         }
+                        if (!isActiveGen() || !state.enabled) return;
                         invalidateRpcCtx({ preserveReady: true });
                         G.rpcConnectingSince = Date.now();
                         return;
@@ -1160,13 +1198,20 @@
                     if (shouldWake) {
                         lastEnsureConnAt = now;
                         try {
-                            await pendingCtx.ensureLiveConnection();
+                            await withTimeout(
+                                Promise.resolve().then(() => pendingCtx.ensureLiveConnection()),
+                                6000,
+                                'ensureLiveConnection'
+                            );
+                            if (!isActiveGen() || !state.enabled) return;
                             invalidateRpcCtx();
                             readyCtx = findRpcCtx({ allowPending: false });
                         } catch (wakeErr) {
+                            if (!isActiveGen() || !state.enabled) return;
                             rpcConsecutiveFails++;
                             if (rpcConsecutiveFails >= 2) G.rpcReady = false;
                             nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
+                            if (wakeErr && wakeErr.code === 'RPC_TIMEOUT') nextDelay = Math.max(nextDelay, 15000);
                             reportRpcFailure('连不上', wakeErr, nextDelay);
                             return;
                         }
@@ -1189,6 +1234,8 @@
 
             // 第二步：主动向审批系统查询待批单子（完全不依赖页面出卡或 DOM 扫描）
             const resp = await rpcCall('egress.approvals', {});
+            if (!isActiveGen()) return;
+            if (!state.enabled) return;
             if (isRpcResultRejected(resp)) {
                 const errMsg = (resp.error && resp.error.message) || resp.error || resp.message || 'egress.approvals 返回失败';
                 throw new Error(String(errMsg));
@@ -1218,6 +1265,7 @@
                     const out = await decideSmart(item, state.decision);
                     G.seen.set(id, Date.now());
                     G.failState.delete(id);
+                    if (!isActiveGen() || !state.enabled) continue;
                     G.lastRpcApproveAt = Date.now();
                     const tierLabel = out.decision === 'allow_always'
                         ? '永久允许'
@@ -1230,8 +1278,13 @@
                     const prev = G.failState.get(id) || { count: 0, nextTryAt: 0 };
                     const count = prev.count + 1;
                     // 单项失败指数退避（2s -> 4s -> 8s -> 16s -> 30s -> 45s），永不永久拉黑
-                    const backoff = Math.min(2000 * Math.pow(2, Math.min(count - 1, 4)), 45000);
+                    const exponentialBackoff = Math.min(2000 * Math.pow(2, Math.min(count - 1, 4)), 45000);
+                    const backoff = err && err.code === 'RPC_TIMEOUT' ? Math.max(15000, exponentialBackoff) : exponentialBackoff;
                     G.failState.set(id, { count, nextTryAt: Date.now() + backoff });
+                    if (err && err.code === 'RPC_TIMEOUT') {
+                        G.rpcUncertainUntil = Math.max(G.rpcUncertainUntil || 0, Date.now() + 20000);
+                    }
+                    if (!isActiveGen() || !state.enabled) continue;
                     const msg = (err && err.message) ? err.message : String(err);
                     G.rpcLog.push({ id, title, ok: false, error: msg, count, at: Date.now() });
                     if (G.rpcLog.length > 200) G.rpcLog.shift();
@@ -1243,6 +1296,7 @@
                         rpcConsecutiveFails++;
                         invalidateRpcCtx({ preserveReady: rpcConsecutiveFails < 2 });
                         nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
+                        if (err && err.code === 'RPC_TIMEOUT') nextDelay = Math.max(nextDelay, 15000);
                         reportRpcFailure('连不上', err, nextDelay);
                         break;
                     }
@@ -1253,8 +1307,10 @@
 
             pruneRpcMaps(activeIds);
         } catch (e) {
+            if (!isActiveGen() || !state.enabled) return;
             rpcConsecutiveFails++;
             nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
+            if (e && e.code === 'RPC_TIMEOUT') nextDelay = Math.max(nextDelay, 15000);
             const category = isAuthError(e) ? '没权限' : (isConnectionError(e) ? '连不上' : '接口报错');
             if (isConnectionError(e)) {
                 invalidateRpcCtx({ preserveReady: rpcConsecutiveFails < 2 });
@@ -1267,8 +1323,10 @@
             reportRpcFailure(category, e, nextDelay);
         } finally {
             rpcTickRunning = false;
-            if (isActiveGen()) {
+            if (isActiveGen() && state.enabled) {
                 owned.rpcTimer = setTimeout(rpcTick, nextDelay);
+            } else {
+                owned.rpcTimer = null;
             }
         }
     }
@@ -1342,10 +1400,11 @@
     const FORBIDDEN_ANCESTOR_SELECTOR = 'pre, code, nav, [role="navigation"], [role="menubar"], [inert], [data-muse-aa-ui="1"]';
 
     const domCooldownMap = new WeakMap();
-    const domPendingVerify = new WeakSet();
+    const domPendingVerify = new Set();
     const domFirstSeenMap = new WeakMap();
     const domFailCountMap = new WeakMap();
     const domFailureSuppressed = new WeakSet();
+    const domSuppressedUntil = new WeakMap();
     let lastDomClickAt = 0;
 
     function getParentAcrossShadow(node) {
@@ -1461,8 +1520,8 @@
         return false;
     }
 
-    // 审批上下文校验：彻底根治误点页面普通“允许/Allow/Approve”按钮
-    function verifyApprovalContext(btn, tier, isStandardInteractive) {
+    // 审批上下文校验：普通“允许/Allow/Approve”文案单独出现时不构成审批证据。
+    function verifyApprovalContext(btn) {
         if (hasForbiddenAncestor(btn)) return { ok: false };
 
         const role = ((btn.getAttribute && btn.getAttribute('role')) || '').toLowerCase();
@@ -1478,8 +1537,9 @@
 
             // 判据 1：同一卡片/弹窗内存在配对的“拒绝/取消”类按钮（最铁审批特征）
             if (cur.querySelectorAll) {
-                const peers = cur.querySelectorAll(INTERACTIVE_SELECTOR);
-                for (let i = 0; i < peers.length && i < 40; i++) {
+                const peerTextSize = (cur.textContent || '').trim().length;
+                const peers = peerTextSize <= 900 ? cur.querySelectorAll(INTERACTIVE_SELECTOR) : [];
+                for (let i = 0; i < peers.length && i < 12; i++) {
                     const peer = peers[i];
                     if (peer === btn || !peer.isConnected) continue;
                     const pText = extractVisibleText(peer);
@@ -1491,7 +1551,7 @@
 
             // 判据 2：祖先容器包含明确的审批/权限提示语（且容器文字量合理，非整页正文）
             const cText = (cur.textContent || '').replace(/\s+/g, ' ').trim();
-            if (cText.length > 0 && cText.length <= 2600) {
+            if (cText.length > 0 && cText.length <= 1200) {
                 const lower = cText.toLowerCase();
                 for (let i = 0; i < APPROVAL_CLUES.length; i++) {
                     if (lower.includes(APPROVAL_CLUES[i])) {
@@ -1502,11 +1562,6 @@
 
             // 如果已经爬到一个明确的弹窗/对话框外层还没命中，也继续检查上一层直到上限
             cur = getParentAcrossShadow(cur);
-        }
-
-        // 判据 3：Tier 1~4 属于高置信度批量/永久/范围审批专有词，标准交互按钮且非设置控件允许放行
-        if (tier <= 4 && isStandardInteractive) {
-            return { ok: true, clue: `专有审批档位T${tier}` };
         }
 
         return { ok: false };
@@ -1533,18 +1588,9 @@
             if (!r || visited.has(r)) return;
             visited.add(r);
             roots.push(r);
-
-            // 探索已打开的 shadowRoot 和同源 iframe
-            if (r.querySelectorAll) {
-                const iframes = r.querySelectorAll('iframe');
-                for (let i = 0; i < iframes.length; i++) {
-                    try {
-                        if (iframes[i].contentDocument) addRoot(iframes[i].contentDocument);
-                    } catch (e) {}
-                }
-            }
         };
 
+        // iframe 由其自身匹配到的 userscript 实例处理，避免顶层与子 frame 双重点击。
         addRoot(doc);
         const shadows = getActiveShadowRoots();
         for (let i = 0; i < shadows.length; i++) {
@@ -1568,16 +1614,27 @@
 
             const priorFails = domFailCountMap.get(target) || 0;
             if (isTop && G.rpcReady && priorFails >= 2) {
-                if (!domFailureSuppressed.has(target)) {
+                let until = domSuppressedUntil.get(target);
+                if (!until) {
+                    until = now + 60000;
+                    domSuppressedUntil.set(target, until);
+                }
+                if (now < until) {
+                    if (!domFailureSuppressed.has(target)) {
                     domFailureSuppressed.add(target);
                     console.warn(TAG, `⚠ 协议在线时页面按钮「${extractVisibleText(target)}」已连续无效 ${priorFails} 次，暂停重复点击；协议离线时会恢复兜底`);
+                    }
+                    return;
                 }
-                return;
+                domFailureSuppressed.delete(target);
+                domSuppressedUntil.delete(target);
+                domFailCountMap.set(target, 0);
             }
 
             if (isDisabledButton(target) || domPendingVerify.has(target)) return;
             const lastClick = domCooldownMap.get(target) || 0;
-            if (now - lastClick < 1500) return;
+            const retryDelay = priorFails > 0 ? Math.min(2000 * Math.pow(2, Math.min(priorFails - 1, 4)), 30000) : 1500;
+            if (now - lastClick < retryDelay) return;
 
             const rawText = extractVisibleText(target);
             const tier = classifyButtonTier(rawText);
@@ -1600,7 +1657,7 @@
                 if (!clickable) return;
             }
 
-            const ctx = verifyApprovalContext(target, tier, isStandardInteractive);
+            const ctx = verifyApprovalContext(target);
             if (!ctx.ok) return;
 
             best = { target, rawText, tier, clue: ctx.clue };
@@ -1638,7 +1695,7 @@
         return best;
     }
 
-    function dispatchClickChain(el, forceReactCallback = false) {
+    function dispatchClickChain(el) {
         if (!el) return;
         try {
             // 直接触发元素 click，不模拟鼠标移动、按下或抬起事件。
@@ -1646,25 +1703,6 @@
                 el.click();
             } else {
                 el.dispatchEvent(new Event('click', { bubbles: true, cancelable: true }));
-            }
-
-            // 仅在首次直接 click 未生效后的重试中，才追加 React onClick。
-            if (forceReactCallback) {
-                for (const k of Object.keys(el)) {
-                    if (k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$')) {
-                        const props = el[k];
-                        if (props && typeof props.onClick === 'function') {
-                            props.onClick({
-                                target: el,
-                                currentTarget: el,
-                                preventDefault() {},
-                                stopPropagation() {},
-                                nativeEvent: new Event('click', { bubbles: true, cancelable: true }),
-                            });
-                            break;
-                        }
-                    }
-                }
             }
         } catch (e) {}
     }
@@ -1674,9 +1712,16 @@
         domPendingVerify.add(btn);
         const checkpoints = [220, 520, 950];
         let idx = 0;
+        const scheduleCheck = (fn, delay) => {
+            const timer = setTimeout(() => {
+                owned.domVerifyTimers.delete(timer);
+                fn();
+            }, delay);
+            owned.domVerifyTimers.add(timer);
+        };
 
         const check = () => {
-            if (!isActiveGen()) {
+            if (!isActiveGen() || !state.enabled) {
                 domPendingVerify.delete(btn);
                 return;
             }
@@ -1689,6 +1734,7 @@
                 domPendingVerify.delete(btn);
                 domFailCountMap.delete(btn);
                 domFailureSuppressed.delete(btn);
+                domSuppressedUntil.delete(btn);
                 G.domLog.push({ text: rawText, tier, clue, ok: true, at: Date.now() });
                 if (G.domLog.length > 200) G.domLog.shift();
                 recordApproved('dom', rawText);
@@ -1699,7 +1745,7 @@
             idx++;
             if (idx < checkpoints.length) {
                 const delta = checkpoints[idx] - checkpoints[idx - 1];
-                setTimeout(check, delta);
+                scheduleCheck(check, delta);
             } else {
                 // 超过 950ms 仍纹丝不动：不虚增计数，记录一次失败以便下轮升级破冰模式
                 domPendingVerify.delete(btn);
@@ -1707,12 +1753,12 @@
                 domFailCountMap.set(btn, fails);
                 G.domLog.push({ text: rawText, tier, clue, ok: false, fails, at: Date.now() });
                 if (G.domLog.length > 200) G.domLog.shift();
-                console.warn(TAG, `⚠ [页面精点未生效#${fails}]「${rawText}」，不计入通过数，稍后升级重试`);
+                console.warn(TAG, `⚠ [页面精点未生效#${fails}]「${rawText}」，不计入通过数，按冷却策略重试`);
                 showErrorToast('兜底线', `点击「${rawText}」未生效，稍后自动重试`);
             }
         };
 
-        setTimeout(check, checkpoints[0]);
+        scheduleCheck(check, checkpoints[0]);
     }
 
     function domScan() {
@@ -1734,6 +1780,16 @@
         }
 
         const now = Date.now();
+        if (isTop && (G.inFlight.size > 0 || now < G.rpcUncertainUntil)) {
+            if (!owned.domDeferTimer) {
+                const waitMs = G.inFlight.size > 0 ? 700 : Math.min(1500, Math.max(250, G.rpcUncertainUntil - now));
+                owned.domDeferTimer = setTimeout(() => {
+                    owned.domDeferTimer = null;
+                    domScan();
+                }, waitMs);
+            }
+            return;
+        }
         if (now - lastDomClickAt < 420) return;
 
         const chosen = findBestApprovalButton(now);
@@ -1761,10 +1817,7 @@
 
         lastDomClickAt = now;
         domCooldownMap.set(chosen.target, now);
-        const prevFails = domFailCountMap.get(chosen.target) || 0;
-        const useForceReact = prevFails >= 1;
-
-        dispatchClickChain(chosen.target, useForceReact);
+        dispatchClickChain(chosen.target);
         verifyDomClickOutcome(chosen.target, chosen.rawText, chosen.tier, chosen.clue);
     }
 
@@ -1778,7 +1831,7 @@
     }
 
     function attachObserver(root) {
-        if (!root || !isActiveGen() || owned.observedRoots.has(root)) return;
+        if (!root || !isActiveGen() || !state.enabled || owned.observedRoots.has(root)) return;
         if (typeof MutationObserver === 'undefined') return;
         try {
             const obs = new MutationObserver(() => {
@@ -1794,10 +1847,41 @@
         } catch (e) {}
     }
 
+    function stopRuntimeLoops() {
+        if (owned.rpcTimer) { clearTimeout(owned.rpcTimer); owned.rpcTimer = null; }
+        if (owned.rpcWakeTimer) { clearTimeout(owned.rpcWakeTimer); owned.rpcWakeTimer = null; }
+        if (owned.domTimer) { clearInterval(owned.domTimer); owned.domTimer = null; }
+        if (owned.domThrottleTimer) { clearTimeout(owned.domThrottleTimer); owned.domThrottleTimer = null; }
+        if (owned.domDeferTimer) { clearTimeout(owned.domDeferTimer); owned.domDeferTimer = null; }
+        for (const timer of owned.domVerifyTimers) clearTimeout(timer);
+        owned.domVerifyTimers.clear();
+        domPendingVerify.clear();
+        for (const obs of owned.observers) {
+            try { obs.disconnect(); } catch (e) {}
+        }
+        owned.observers.clear();
+        owned.observedRoots.clear();
+    }
+
+    function startRuntimeLoops() {
+        if (!isActiveGen() || !state.enabled) return;
+        attachObserver(doc.body || doc.documentElement);
+        for (const sr of getActiveShadowRoots()) attachObserver(sr);
+        if (isTop && !owned.rpcTimer && !rpcTickRunning) owned.rpcTimer = setTimeout(rpcTick, 50);
+        if (!owned.domTimer) owned.domTimer = setInterval(domScan, state.domIntervalMs);
+        scheduleDomScanSoon(50);
+    }
+
+    function syncRuntimeEnabled() {
+        if (state.enabled) startRuntimeLoops();
+        else stopRuntimeLoops();
+    }
+
     // 新捕获的 Closed Shadow DOM 自动挂监听
-    G.onShadowAttached = (sr) => {
-        if (isActiveGen()) attachObserver(sr);
+    shadowAttachedHook = (sr) => {
+        if (isActiveGen() && state.enabled) attachObserver(sr);
     };
+    G.onShadowAttached = shadowAttachedHook;
 
     // =========================================================================
     // 主开关与控制台高级工具（兼容 v2.3.0 __musePerm 全部接口并修复 RISKY）
@@ -1808,10 +1892,8 @@
         saveState();
         renderBadge();
         broadcastEnabledToFrames(state.enabled);
-        if (state.enabled) {
-            scheduleDomScanSoon(50);
-            wakeRpcSoon();
-        }
+        syncRuntimeEnabled();
+        if (state.enabled) wakeRpcSoon();
         return state.enabled;
     }
 
@@ -1968,6 +2050,7 @@
             rpcStatusReason: G.rpcStatusReason,
             rpcLastError: G.rpcLastError,
             rpcContextMissingMs: G.rpcMissingSince ? Math.max(0, Date.now() - G.rpcMissingSince) : 0,
+            rpcUncertainRemainingMs: Math.max(0, (G.rpcUncertainUntil || 0) - Date.now()),
             lastRpcApprovedAt: state.lastRpcApprovedAt,
             lastRpcApprovedTime: formatClockTime(state.lastRpcApprovedAt) || null,
             domFallbackActive: state.enabled && !G.rpcReady,
@@ -1984,22 +2067,20 @@
     // 清理本实例所有句柄（绝不触碰其他新实例）
     function teardown() {
         owned.destroyed = true;
-        if (owned.rpcTimer) { clearTimeout(owned.rpcTimer); owned.rpcTimer = null; }
-        if (owned.rpcWakeTimer) { clearTimeout(owned.rpcWakeTimer); owned.rpcWakeTimer = null; }
-        if (owned.domTimer) { clearInterval(owned.domTimer); owned.domTimer = null; }
-        if (owned.domThrottleTimer) { clearTimeout(owned.domThrottleTimer); owned.domThrottleTimer = null; }
-        if (owned.domDeferTimer) { clearTimeout(owned.domDeferTimer); owned.domDeferTimer = null; }
+        stopRuntimeLoops();
+        if (owned.toastTimer) { clearTimeout(owned.toastTimer); owned.toastTimer = null; }
+        if (owned.detailHideTimer) { clearTimeout(owned.detailHideTimer); owned.detailHideTimer = null; }
         clearErrorToast();
         hideDetailPanel();
         if (detailPanel && detailPanel.isConnected) detailPanel.remove();
         detailPanel = null;
-        for (const obs of owned.observers) {
-            try { obs.disconnect(); } catch (e) {}
-        }
-        owned.observers.clear();
         win.removeEventListener('message', onWindowMessage);
         win.removeEventListener('storage', onStorageSync);
         win.removeEventListener('resize', onResize);
+        if (G.onShadowAttached === shadowAttachedHook) G.onShadowAttached = previousShadowAttachedHook || null;
+        if (elemProto && shadowHookPatched && elemProto.attachShadow === shadowHookPatched) {
+            elemProto.attachShadow = shadowHookOriginal;
+        }
     }
 
     G.activeTeardown = teardown;
@@ -2055,15 +2136,10 @@
                 G.bannerShown = true;
                 console.log(TAG, `v${VERSION} 已加载（协议优先：RPC第一引擎主动查单 + DOM第二引擎兜底）`);
             }
-            // 第一引擎：协议线立刻主动启动，不等待也不依赖页面出卡
-            owned.rpcTimer = setTimeout(rpcTick, 100);
         }
 
-        // 第二引擎：DOM 穿透点控退居兜底（协议连不上或查不到时接管）
-        attachObserver(doc.body || doc.documentElement);
-        for (const sr of getActiveShadowRoots()) attachObserver(sr);
-        domScan();
-        owned.domTimer = setInterval(domScan, state.domIntervalMs || 1200);
+        // 协议轮询与 DOM 兜底只在开关开启时启动。
+        startRuntimeLoops();
     }
 
     if (doc.readyState === 'loading') {

@@ -11,9 +11,9 @@ const MANIFEST = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.m
     const strippedUser = USER_JS.replace(/^\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\s*/, '')
         .replace('免责声明：本脚本', '免责声明：本扩展');
     assert.equal(strippedUser.trim(), CONTENT_JS.trim(), 'muse-auto-approve.user.js 与 content.js 主体必须一致');
-    assert.equal(MANIFEST.version, '7.0.8');
+    assert.equal(MANIFEST.version, '7.1.0');
     assert.equal(MANIFEST.content_scripts[0].world, 'MAIN');
-    assert.match(USER_JS, /@version\s+7\.0\.8/);
+    assert.match(USER_JS, /@version\s+7\.1\.0/);
     assert.match(USER_JS, /@grant\s+none/);
     assert.match(USER_JS, /@run-at\s+document-start/);
     console.log('[PASS] 0. 元数据、双模同步与 manifest.json 校验通过');
@@ -364,10 +364,13 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     const alwaysConnBtn = makeBtn('始终允许此连接器');         // Tier 2
     const alwaysSiteEnBtn = makeBtn('Always allow this site'); // Tier 2
     const allBtn = makeBtn('全部允许 (3)');                   // Tier 1
-    env.body.appendChild(card);
 
     env.runScript();
-    await env.advance(300);
+    // v7.1.0：开机不再立即扫 DOM，且无 RPC 上下文有 5 秒挂载宽限（期间暂停点击）；
+    // 先让宽限在只有陷阱按钮的环境里过完，再挂上审批卡验档位（陷阱全程不得被点）。
+    await env.advance(6000);
+    env.body.appendChild(card);
+    await env.advance(1300);
 
     // 陷阱全部为 0
     assert.equal(strayAllow.clickCount, 0, '孤立 Allow 绝不能误点');
@@ -381,7 +384,6 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     assert.equal(alwaysSiteBtn.clickCount, 0);
     assert.equal(batchOnceBtn.clickCount, 0);
 
-    await env.advance(3800); // v7.0.8：无 RPC 上下文先过 5 秒挂载宽限（期间暂停点击），宽限后继续后面的轮次
     // 第 2~4 轮：Tier 2 永久/始终类（始终允许此网站 / 始终允许此连接器 / Always allow this site）全部排在「全部允许一次」之前！
     await env.advance(1300);
     assert.equal(alwaysSiteBtn.clickCount, 1, '第 2 轮必须先选 Tier 2：始终允许此网站（先于全部允许一次）');
@@ -442,15 +444,25 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     await env.advance(1300);
     assert.equal(shareBtnEn.clickCount, 1, '英文「share information with」卡片必须识别并点中 Allow');
 
-    // 验证另外两个范围新词「此任务内允许」「Allow for this site」也无需配对拒绝即可直接放行（Tier 4 专有短语）
+    // v7.1.0 起 Tier 4 专有短语也不再单独放行：必须带审批上下文（有卡片文案线索即可，无需配对拒绝）
+    const scopeCard1 = env.document.createElement('div');
+    const scopeTitle1 = env.document.createElement('div');
+    scopeTitle1.textContent = '需要批准：允许 Muse 在此任务内继续';
     const standaloneScope1 = env.document.createElement('button');
     standaloneScope1.textContent = '此任务内允许';
     standaloneScope1._onNativeClick = (x) => x.remove();
+    scopeCard1.appendChild(scopeTitle1);
+    scopeCard1.appendChild(standaloneScope1);
+    env.body.appendChild(scopeCard1);
+    const scopeCard2 = env.document.createElement('div');
+    const scopeTitle2 = env.document.createElement('div');
+    scopeTitle2.textContent = 'Approval required: allow Muse to continue';
     const standaloneScope2 = env.document.createElement('button');
     standaloneScope2.textContent = 'Allow for this site';
     standaloneScope2._onNativeClick = (x) => x.remove();
-    env.body.appendChild(standaloneScope1);
-    env.body.appendChild(standaloneScope2);
+    scopeCard2.appendChild(scopeTitle2);
+    scopeCard2.appendChild(standaloneScope2);
+    env.body.appendChild(scopeCard2);
 
     await env.advance(2600);
     assert.equal(standaloneScope1.clickCount, 1, 'Tier 4「此任务内允许」必须被识别点击');
@@ -459,7 +471,7 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     console.log('[PASS] 3. 五级档位排序（含 v7.0.1 补词与分享卡线索）、角标剥离与防误点校验通过');
 }
 
-// 4. Closed Shadow DOM 穿透 + 验成败真实计数（假死不虚增 + 失败升级 React 破冰）
+// 4. Closed Shadow DOM 穿透（v7.1.0 保留 closed 模式、靠返回值捕获引用）+ 验成败真实计数（假死不虚增 + 冷却重试）
 {
     const env = createEnv();
     env.runScript();
@@ -468,38 +480,36 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     const host = env.document.createElement('div');
     env.body.appendChild(host);
     const sr = host.attachShadow({ mode: 'closed' });
-    assert.equal(sr.mode, 'open', 'closed shadow 必须被降级为 open');
+    // v7.1.0：不再把 closed 强改 open；保留页面声明的模式，靠劫持 attachShadow 的返回值捕获 root 引用照样穿透
+    assert.equal(sr.mode, 'closed', 'v7.1.0：closed 模式应被保留，不再强制降级 open');
+    assert.equal(env.win.__musePerm.diag().activeShadows, 1, 'closed root 的引用必须已被捕获');
 
     const modal = env.document.createElement('div');
     const title = env.document.createElement('div');
     title.textContent = '需要批准：允许 Muse 上传这个文件';
     const allowBtn = env.document.createElement('button');
     allowBtn.textContent = '允许';
-    allowBtn.__reactProps$test = {
-        onClick() {
-            allowBtn.reactClickCount++;
-            allowBtn.remove();
-        },
-    };
+    let nativeClicks = 0;
+    allowBtn._onNativeClick = (x) => { nativeClicks++; if (nativeClicks >= 2) x.remove(); };
     modal.appendChild(title);
     modal.appendChild(allowBtn);
     sr.appendChild(modal);
 
     await env.advance(1300);
-    assert.equal(allowBtn.clickCount, 1, '第一次先发标准事件链，不双触发 React onClick');
-    assert.equal(allowBtn.reactClickCount, 0, '首次不得双触发 React onClick');
+    assert.equal(allowBtn.clickCount, 1, '第一次先发原生 click');
+    assert.equal(nativeClicks, 1, '首次原生 click 已送达但按钮未消失（模拟假死）');
 
     await env.advance(1000);
     assert.equal(env.win.__musePerm.diag().domCount, 0, '点击未生效时绝不虚增计数');
 
-    await env.advance(1800);
-    assert.equal(allowBtn.reactClickCount, 1, '重试必须升级触发 React onClick 破冰');
-    await env.advance(300);
-    assert.equal(env.win.__musePerm.diag().domCount, 1, '破冰生效后真实计数 +1');
+    await env.advance(3200);
+    assert.equal(nativeClicks, 2, 'v7.1.0：重试按冷却再次原生 click（不再直调 React onClick）');
+    await env.advance(600);
+    assert.equal(env.win.__musePerm.diag().domCount, 1, '重试生效后真实计数 +1');
 
     host.remove();
     assert.equal(env.win.__musePerm.diag().activeShadows, 0, '已卸载的 ShadowRoot 必须被清理');
-    console.log('[PASS] 4. Closed Shadow DOM 穿透、验成败真实计数与破冰重试通过');
+    console.log('[PASS] 4. Closed Shadow DOM 穿透、验成败真实计数与冷却重试通过');
 }
 
 // 5. RPC 引擎全测试：假 context 防护 + allow_always 降级 allow_once + 并发占坑防重 + 断连自愈 + 指数退避不拉黑
@@ -576,6 +586,12 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     fakeCtx.isReady = true;
     fakeCtx.connectionState = 'connected';
     await env.advance(2500);
+    // v7.1.0：decide 遇连接类失败不再当场重放（怕服务端已处理、响应丢失造成重复批），
+    // 失败项按退避在后续轮询里重新协调；ap_slow 的 30ms 是真实计时器，先让在飞的这一轮落定再推时钟。
+    await new Promise((r) => setTimeout(r, 120));
+    await env.advance(6000);
+    await new Promise((r) => setTimeout(r, 120));
+    await env.advance(3000);
 
     const permDecisions = calls.filter((c) => c.method === 'egress.approval.decide' && c.payload.approval_id === 'ap_perm');
     assert.deepEqual(permDecisions.map((c) => c.payload.decision), ['allow_always', 'allow_always']);
@@ -831,9 +847,9 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     await env.advance(20_200);
 
     const dFail = env.win.__musePerm.diag();
-    // v7.0.8 新语义：权限类（403）响应不是传输断线，协议引擎保持在线，不因单类报错被打离线
-    assert.equal(dFail.rpcReady, true, 'v7.0.8：权限类报错后协议引擎应保持在线');
-    assert.equal(dFail.domFallbackActive, false, 'v7.0.8：协议保持在线时 DOM 兜底不处于激活态（出卡时仍会礼让 450ms 后接管）');
+    // v7.0.4 起的新语义：权限类（403）响应不是传输断线，协议引擎保持在线，不因单类报错被打离线
+    assert.equal(dFail.rpcReady, true, 'v7.1.0：权限类报错后协议引擎应保持在线');
+    assert.equal(dFail.domFallbackActive, false, 'v7.1.0：协议保持在线时 DOM 兜底不处于激活态（出卡时仍会礼让 450ms 后接管）');
     assert.equal(dFail.rpcLastError.category, '没权限', '403 必须准确归类为「没权限」');
     assert.match(dFail.rpcLastError.raw, /403 permission denied: egress token expired/, '必须保留接口报错原文');
 
@@ -849,13 +865,13 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     // 验证原版胶囊：收起态依然小巧（只含「自动 + 数字」），小圆点变柔琥珀色指示未连，悬停写明失败原因
     const badge = env.document.getElementById('muse-aa-badge-v7');
     assert.equal(badge.textContent, '自动0', '协议未连时收起态仍保持原版迷你大小不撑大');
-    assert.equal(badge.children[0].style.background, '#a7f3d0', 'v7.0.8：权限类报错保持在线，小圆点仍为薄荷绿');
-    assert.match(badge.title, /协议已连接/, 'v7.0.8：保持在线时胶囊悬停显示已连接（具体报错看 diag.rpcLastError 与日志）');
+    assert.equal(badge.children[0].style.background, '#a7f3d0', 'v7.1.0：权限类报错保持在线，小圆点仍为薄荷绿');
+    assert.match(badge.title, /协议已连接/, 'v7.1.0：保持在线时胶囊悬停显示已连接（具体报错看 diag.rpcLastError 与日志）');
 
     // 悬停详情面板同样展示未连接状态与具体失败原因
     badge.dispatchEvent(new env.win.PointerEvent('pointerenter', {}));
     const detailFail = env.document.getElementById('muse-aa-detail-v7');
-    assert.match(detailFail.textContent, /协议状态：已连接/, 'v7.0.8：详情面板显示保持在线');
+    assert.match(detailFail.textContent, /协议状态：已连接/, 'v7.1.0：详情面板显示保持在线');
     assert.equal(dFail.rpcLastError.raw, '403 permission denied: egress token expired', '报错原文保留在 diag 中可查');
 
     // 此时页面出现审批卡片（同时带 Tier2「始终允许此网站」与 Tier5「允许」），DOM 第二引擎必须立刻 0 礼让兜底并按 7.0.1 五档优先点 Tier2！
@@ -874,7 +890,7 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
 
     env.win.__musePerm.scanDom();
     await env.advance(900);
-    assert.equal(siteAlwaysBtn.clickCount, 1, 'v7.0.8：协议保持在线时 DOM 第二引擎礼让 450ms 后接管，并按五档优先点「始终允许此网站」');
+    assert.equal(siteAlwaysBtn.clickCount, 1, 'v7.1.0：协议保持在线时 DOM 第二引擎礼让 450ms 后接管，并按五档优先点「始终允许此网站」');
     assert.equal(singleBtn.clickCount, 0);
     assert.equal(env.win.__musePerm.diag().domCount, 1);
 
