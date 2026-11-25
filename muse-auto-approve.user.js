@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Muse 自动审批 (经典穿透 + 迷你拖拽融合版)
 // @namespace    https://github.com/waw666waw666/MuseAutoApprove
-// @version      7.0.6
+// @version      7.0.7
 // @description  协议优先双引擎（RPC主动查单为主 + Closed Shadow DOM/iframe穿透兜底）：优先全部/永久允许，审批上下文防误点，验成败真实计数，原版迷你可拖拽胶囊与悬停详情
 // @author       waw666waw666
 // @match        *://muse.ai/*
@@ -17,7 +17,7 @@
     'use strict';
 
     // 免责声明：本脚本仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.0.6';
+    const VERSION = '7.0.7';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -1328,6 +1328,7 @@
     const domPendingVerify = new WeakSet();
     const domFirstSeenMap = new WeakMap();
     const domFailCountMap = new WeakMap();
+    const domFailureSuppressed = new WeakSet();
     let lastDomClickAt = 0;
 
     function getParentAcrossShadow(node) {
@@ -1548,6 +1549,15 @@
             if (target !== el && checkedNodes.has(target)) return;
             checkedNodes.add(target);
 
+            const priorFails = domFailCountMap.get(target) || 0;
+            if (isTop && G.rpcReady && priorFails >= 2) {
+                if (!domFailureSuppressed.has(target)) {
+                    domFailureSuppressed.add(target);
+                    console.warn(TAG, `⚠ 协议在线时页面按钮「${extractVisibleText(target)}」已连续无效 ${priorFails} 次，暂停重复点击；协议离线时会恢复兜底`);
+                }
+                return;
+            }
+
             if (isDisabledButton(target) || domPendingVerify.has(target)) return;
             const lastClick = domCooldownMap.get(target) || 0;
             if (now - lastClick < 1500) return;
@@ -1661,6 +1671,7 @@
             if (gone || disabled || hidden || textChanged) {
                 domPendingVerify.delete(btn);
                 domFailCountMap.delete(btn);
+                domFailureSuppressed.delete(btn);
                 G.domLog.push({ text: rawText, tier, clue, ok: true, at: Date.now() });
                 if (G.domLog.length > 200) G.domLog.shift();
                 recordApproved('dom', rawText);
