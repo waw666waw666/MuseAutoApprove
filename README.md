@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-7.2.0-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-7.2.1-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -99,7 +99,7 @@
 
 ### 方式二：Chrome 扩展安装（开发者模式）
 
-1. 前往 [Releases 发布页](https://github.com/waw666waw666/MuseAutoApprove/releases) 直接下载打包好的 `MuseAutoApprove-v7.2.0.zip` 并解压（或直接下载/克隆本仓库）。
+1. 前往 [Releases 发布页](https://github.com/waw666waw666/MuseAutoApprove/releases) 直接下载打包好的 `MuseAutoApprove-v7.2.1.zip` 并解压（或直接下载/克隆本仓库）。
 2. 在 Chromium 浏览器（Chrome、Edge、Brave、Arc 等）地址栏输入：
    ```text
    chrome://extensions/

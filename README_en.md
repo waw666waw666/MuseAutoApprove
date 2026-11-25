@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-7.2.0-emerald?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-7.2.1-emerald?style=flat-square" alt="Version" />
   <img src="https://img.shields.io/badge/Manifest-V3-blue?style=flat-square" alt="Manifest V3" />
   <img src="https://img.shields.io/badge/Tampermonkey-Supported-green?style=flat-square" alt="Tampermonkey" />
   <img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" alt="License" />
@@ -98,7 +98,7 @@ This project supports both **Chrome / Edge Extension** and **Tampermonkey Usersc
 
 ### Method 2: Chrome Extension Installation (Developer Mode)
 
-1. Download the pre-packaged `MuseAutoApprove-v7.2.0.zip` from the [Releases page](https://github.com/waw666waw666/MuseAutoApprove/releases) and extract it (or clone this repository).
+1. Download the pre-packaged `MuseAutoApprove-v7.2.1.zip` from the [Releases page](https://github.com/waw666waw666/MuseAutoApprove/releases) and extract it (or clone this repository).
 2. Navigate to `chrome://extensions/` in your Chromium-based browser (Chrome, Edge, Brave, Arc, etc.).
 3. Toggle on **"Developer mode"** in the top-right corner.
 4. Click **"Load unpacked"** in the top-left corner.

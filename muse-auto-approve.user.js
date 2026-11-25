@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Muse 自动审批 (经典穿透 + 迷你拖拽融合版)
 // @namespace    https://github.com/waw666waw666/MuseAutoApprove
-// @version      7.2.0
+// @version      7.2.1
 // @description  协议优先自动审批：RPC优先、保守降级、无鼠标模拟，带请求超时与暂停调度
 // @author       waw666waw666
 // @match        *://muse.ai/*
@@ -17,7 +17,7 @@
     'use strict';
 
     // 免责声明：本脚本仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.2.0';
+    const VERSION = '7.2.1';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -915,7 +915,7 @@
     function isDecisionUnsupportedError(err) {
         if (!err || isConnectionError(err) || isAuthError(err)) return false;
         const msg = (err.message || String(err)).toLowerCase();
-        return /unsupported decision|decision (is )?not supported|invalid decision|allow_always (is )?not supported|allow_always not allowed|永久允许.*不支持|不支持.*永久允许|不支持.*decision|不支持.*档位/i.test(msg);
+        return /not an available decision|decision\s+[^.!?]{0,100}\s+not available|unsupported decision|decision (is )?not supported|invalid decision|allow_always (is )?not supported|allow_always not allowed|永久允许.*不支持|不支持.*永久允许|不支持.*decision|不支持.*档位/i.test(msg);
     }
 
     function isRpcResultRejected(res) {
@@ -962,7 +962,7 @@
 
         if (Array.isArray(rawOpts) && rawOpts.length) {
             const norm = rawOpts
-                .map((x) => (typeof x === 'string' ? x : (x && (x.value || x.decision || x.id))))
+                .map((x) => (typeof x === 'string' ? x : (x && (x.kind || x.value || x.decision || x.id))))
                 .filter((x) => typeof x === 'string');
             if (norm.length) {
                 const aliases = { always_allow: 'allow_always', allow_all: 'allow_always', approve: 'allow' };
@@ -1066,6 +1066,7 @@
     }
 
     let rpcTickRunning = false;
+    let rpcIdlePollCount = 0;
     let rpcConsecutiveFails = 0;
     let rpcLastLogKey = '';
     let rpcLastLogAt = 0;
@@ -1372,9 +1373,21 @@
 
             if (loopCompleted) reconcileVerify(activeIds);
 
+            // 空闲时逐步降低主动查单频率：约 1.2s -> 2.4s -> 4.8s -> 最多 6s；
+            // 有待批或待对账项目时立即恢复配置的基础频率。
+            const basePollMs = state.rpcIntervalMs || 1200;
+            if (loopCompleted && list.length === 0 && G.pendingVerify.size === 0) {
+                rpcIdlePollCount = Math.min(rpcIdlePollCount + 1, 4);
+                nextDelay = Math.min(basePollMs * Math.pow(2, rpcIdlePollCount), 6000);
+            } else {
+                rpcIdlePollCount = 0;
+                nextDelay = basePollMs;
+            }
+
             pruneRpcMaps(activeIds);
         } catch (e) {
             if (!isActiveGen() || !state.enabled) return;
+            rpcIdlePollCount = 0;
             rpcConsecutiveFails++;
             nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
             if (e && e.code === 'RPC_TIMEOUT') nextDelay = Math.max(nextDelay, 15000);
