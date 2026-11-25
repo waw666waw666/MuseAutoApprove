@@ -11,9 +11,9 @@ const MANIFEST = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.m
     const strippedUser = USER_JS.replace(/^\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\s*/, '')
         .replace('免责声明：本脚本', '免责声明：本扩展');
     assert.equal(strippedUser.trim(), CONTENT_JS.trim(), 'muse-auto-approve.user.js 与 content.js 主体必须一致');
-    assert.equal(MANIFEST.version, '7.1.0');
+    assert.equal(MANIFEST.version, '7.2.0');
     assert.equal(MANIFEST.content_scripts[0].world, 'MAIN');
-    assert.match(USER_JS, /@version\s+7\.1\.0/);
+    assert.match(USER_JS, /@version\s+7\.2\.0/);
     assert.match(USER_JS, /@grant\s+none/);
     assert.match(USER_JS, /@run-at\s+document-start/);
     console.log('[PASS] 0. 元数据、双模同步与 manifest.json 校验通过');
@@ -763,6 +763,9 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     assert.deepEqual(decisionsById.get('upload_2'), ['allow_always', 'allow_once'], '无卡单 2 应降级 allow_once');
     assert.deepEqual(decisionsById.get('upload_3'), ['allow_always', 'allow_once', 'allow'], '无卡单 3 应降级 allow');
 
+    // v7.2.0：计数改对账确认制——批单已发出，再等一轮查单（名单清空）才确认计数与批单时间
+    await env.advance(2000);
+
     const d = env.win.__musePerm.diag();
     assert.equal(d.rpcReady, true);
     assert.equal(d.rpcStatus, 'connected');
@@ -907,4 +910,88 @@ function createEnv({ hostname = 'muse.ai', isTop = true, initialStorage = {} } =
     console.log('[PASS] 9. 协议失败显式报错/弹窗自动消失 + DOM 五档兜底 + 自动恢复通过');
 }
 
-console.log('\nALL 9 TEST SUITES PASSED!');
+// 10. v7.2.0 对账机制：批完不立刻计数，名单消失才确认；没批成会解除占位重试；超时假成功也能对出真结果 + 漏批原因留痕
+{
+    // 场景 A：decide 返回成功但条目赖在名单里（没真批成）→ 对账过期后重新批；第二次批完名单清空 → 确认计数，全程只计 1 次
+    const env = createEnv();
+    let pendingList = [{ approval_id: 'ap_v1', title: 'verify.me' }];
+    let decideCount = 0;
+    const fakeCtx = {
+        gatewayUrl: 'wss://gw.muse.ai',
+        isReady: true,
+        connectionState: 'connected',
+        connectionAuthority: { targetKey: 'tk-1' },
+        ensureLiveConnection: async () => {},
+        sendRequest: async (method, payload) => {
+            if (method === 'egress.approvals') return { pending_approvals: pendingList };
+            if (method === 'egress.approval.decide') {
+                decideCount++;
+                if (decideCount >= 2) pendingList = [];
+                return { ok: true };
+            }
+            return { ok: true };
+        },
+    };
+    const appRoot = env.document.createElement('div');
+    appRoot.setAttribute('id', '__next');
+    appRoot.__reactFiber$mock = { return: null, dependencies: { firstContext: { memoizedValue: fakeCtx, next: null } }, child: null, sibling: null };
+    env.body.appendChild(appRoot);
+    env.runScript();
+    await env.advance(3000);
+    assert.equal(decideCount, 1, '第一轮应已发出批单');
+    assert.equal(env.win.__musePerm.diag().rpcCount, 0, '对账确认前绝不计数');
+    assert.equal(env.win.__musePerm.diag().pendingVerify, 1, '应有 1 条在对账队列里');
+    await env.advance(25000);
+    await env.advance(6000);
+    assert.equal(decideCount, 2, '对账未通过后必须重新批一次');
+    assert.equal(env.win.__musePerm.diag().rpcCount, 1, '确认后只计 1 次，不重复计数');
+    assert.equal(env.win.__musePerm.diag().pendingVerify, 0, '对账队列应清空');
+
+    // 场景 B：decide 超时报错，但服务端其实已经批了（条目消失）→ 对账确认计数，且绝不重发第二次
+    const env2 = createEnv();
+    let pending2 = [{ approval_id: 'ap_v2', title: 'timeout.but.applied' }];
+    let decide2 = 0;
+    const fakeCtx2 = {
+        gatewayUrl: 'wss://gw.muse.ai',
+        isReady: true,
+        connectionState: 'connected',
+        connectionAuthority: { targetKey: 'tk-1' },
+        ensureLiveConnection: async () => {},
+        sendRequest: async (method, payload) => {
+            if (method === 'egress.approvals') return { pending_approvals: pending2 };
+            if (method === 'egress.approval.decide') {
+                decide2++;
+                pending2 = [];
+                const err = new Error('egress.approval.decide 超时（12000ms）');
+                err.code = 'RPC_TIMEOUT';
+                throw err;
+            }
+            return { ok: true };
+        },
+    };
+    const appRoot2 = env2.document.createElement('div');
+    appRoot2.setAttribute('id', '__next');
+    appRoot2.__reactFiber$mock = { return: null, dependencies: { firstContext: { memoizedValue: fakeCtx2, next: null } }, child: null, sibling: null };
+    env2.body.appendChild(appRoot2);
+    env2.runScript();
+    await env2.advance(3000);
+    assert.equal(decide2, 1, '超时场景第一轮应发过一次批单');
+    await env2.advance(20000);
+    assert.equal(env2.win.__musePerm.diag().rpcCount, 1, '响应丢失但实际批成，必须经对账计入');
+    assert.equal(decide2, 1, '已批成的条目绝不重发第二次批单');
+
+    // 场景 C：漏批原因留痕——孤立「允许」按钮无审批上下文，diag 必须能查到原因
+    const env3 = createEnv();
+    env3.runScript();
+    const lonely = env3.document.createElement('button');
+    lonely.textContent = '允许';
+    lonely._onNativeClick = (x) => x.remove();
+    env3.body.appendChild(lonely);
+    await env3.advance(8000);
+    assert.equal(lonely.clickCount, 0, '无上下文按钮仍不得误点');
+    const skips = env3.win.__musePerm.diag().domSkipLog || [];
+    assert.ok(skips.some((e) => e.reason === '无审批上下文' && e.text === '允许'), '漏批原因必须留痕可查');
+    console.log('[PASS] 10. v7.2.0 对账确认/对账重试/超时对账 + 漏批原因留痕通过');
+}
+
+console.log('\nALL 10 TEST SUITES PASSED!');

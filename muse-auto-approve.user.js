@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Muse 自动审批 (经典穿透 + 迷你拖拽融合版)
 // @namespace    https://github.com/waw666waw666/MuseAutoApprove
-// @version      7.1.0
+// @version      7.2.0
 // @description  协议优先自动审批：RPC优先、保守降级、无鼠标模拟，带请求超时与暂停调度
 // @author       waw666waw666
 // @match        *://muse.ai/*
@@ -17,7 +17,7 @@
     'use strict';
 
     // 免责声明：本脚本仅用于个人工作流自动化提效研究，因自动化操作引发的账号封禁、限制或数据变动等风险均由使用者自行承担。
-    const VERSION = '7.1.0';
+    const VERSION = '7.2.0';
     const TAG = '[Muse自动审批]';
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const doc = win.document || document;
@@ -45,9 +45,11 @@
         rpcReady: false,
         rpcStatusReason: '正在连接审批协议通道...',
         rpcLastError: null,        // { category, reason, raw, at, count, nextRetryMs }
-        inFlight: new Set(),       // 正在请求审批的 approval_id（发请求前占坑防重）
+        inFlight: new Map(),       // 正在请求审批的 approval_id -> 开始时间（发请求前占坑防重；v7.2.0 起带时间戳供清道夫回收）
         seen: new Map(),           // 已批准的 approval_id -> timestamp
         failState: new Map(),      // approval_id -> { count, nextTryAt }
+        pendingVerify: new Map(),  // v7.2.0 对账中：approval_id -> { at, title, decision, uncertain }
+        domSkipLog: [],            // v7.2.0 漏批原因：{ text, reason, at }（最近 30 条）
         lastRpcApproveAt: 0,
         rpcLog: [],
         domLog: [],
@@ -60,6 +62,14 @@
     if (typeof G.rpcReconnectAttempts !== 'number') G.rpcReconnectAttempts = 0;
     if (typeof G.rpcMissingSince !== 'number') G.rpcMissingSince = 0;
     if (typeof G.rpcUncertainUntil !== 'number') G.rpcUncertainUntil = 0;
+    if (!(G.pendingVerify instanceof Map)) G.pendingVerify = new Map();
+    if (!Array.isArray(G.domSkipLog)) G.domSkipLog = [];
+    // v7.2.0：inFlight 升级为带时间戳的 Map；老实例遗留的 Set 在此迁移
+    if (G.inFlight && !(G.inFlight instanceof Map) && typeof G.inFlight.forEach === 'function') {
+        const migrated = new Map();
+        G.inFlight.forEach((id) => migrated.set(id, Date.now()));
+        G.inFlight = migrated;
+    }
 
     // 若旧实例仍在运行，优雅清理旧实例自己的句柄（不破坏新实例）
     if (typeof G.activeTeardown === 'function') {
@@ -1011,6 +1021,50 @@
         throw lastErr || new Error('审批应答失败');
     }
 
+    // v7.2.0 漏批原因记录（同文本同原因 5 秒内只记一次，防刷屏）
+    function noteDomSkip(text, reason) {
+        if (!Array.isArray(G.domSkipLog)) G.domSkipLog = [];
+        const now = Date.now();
+        const last = G.domSkipLog[G.domSkipLog.length - 1];
+        if (last && last.text === text && last.reason === reason && now - last.at < 5000) return;
+        G.domSkipLog.push({ text: String(text || '').slice(0, 40), reason, at: now });
+        if (G.domSkipLog.length > 30) G.domSkipLog.shift();
+    }
+
+    // v7.2.0 对账确认：某条已从待批名单消失 = 服务端确实处理了，这时才计数
+    function confirmVerified(id, entry) {
+        G.pendingVerify.delete(id);
+        G.failState.delete(id);
+        G.seen.set(id, Date.now());
+        G.lastRpcApproveAt = Date.now();
+        const tierLabel = entry.decision === 'allow_always'
+            ? '永久允许'
+            : (entry.decision === 'allow_once' ? '允许一次' : entry.decision);
+        G.rpcLog.push({ id, title: entry.title, decision: entry.decision, ok: true, verified: true, at: Date.now() });
+        if (G.rpcLog.length > 200) G.rpcLog.shift();
+        recordApproved('rpc', `${tierLabel}${entry.title ? ' · ' + entry.title : ''}`);
+        console.log(TAG, `✓ [对账确认 ${tierLabel}]`, id, entry.title);
+    }
+
+    // v7.2.0 对账：名单里消失=已批成；超时仍在名单上=没批成，解除占位交退避重试
+    function reconcileVerify(activeIds) {
+        if (!G.pendingVerify || G.pendingVerify.size === 0) return;
+        const now = Date.now();
+        for (const [id, entry] of [...G.pendingVerify]) {
+            if (!activeIds.has(id)) { confirmVerified(id, entry); continue; }
+            const deadline = entry.uncertain ? 10000 : 20000;
+            if (now - entry.at > deadline) {
+                G.pendingVerify.delete(id);
+                G.seen.delete(id);
+                const prev = G.failState.get(id) || { count: 0, nextTryAt: 0 };
+                G.failState.set(id, { count: prev.count, nextTryAt: Math.max(prev.nextTryAt, now + 2000) });
+                G.rpcLog.push({ id, title: entry.title, ok: false, error: '对账未通过：批单后仍在待批名单', at: now });
+                if (G.rpcLog.length > 200) G.rpcLog.shift();
+                console.warn(TAG, '⚠ [对账未通过，稍后重试]', id, entry.title);
+            }
+        }
+    }
+
     let rpcTickRunning = false;
     let rpcConsecutiveFails = 0;
     let rpcLastLogKey = '';
@@ -1246,6 +1300,15 @@
             const list = pendingOf(resp);
             const activeIds = new Set();
             const now = Date.now();
+            let loopCompleted = true;
+
+            // v7.2.0 在飞清道夫：占坑超过 30 秒没释放视为卡死，强制回收，避免一条堵死整条线
+            for (const [fid, fat] of [...G.inFlight]) {
+                if (now - fat > 30000) {
+                    G.inFlight.delete(fid);
+                    console.warn(TAG, '⚠ [在飞超时自清]', fid);
+                }
+            }
 
             for (const item of list) {
                 if (!isActiveGen() || !state.enabled) break;
@@ -1259,21 +1322,16 @@
                 if (fs && now < fs.nextTryAt) continue;
 
                 // 请求发出前立刻占坑，彻底杜绝并发重复批
-                G.inFlight.add(id);
+                G.inFlight.set(id, Date.now());
                 const title = titleOf(item);
                 try {
                     const out = await decideSmart(item, state.decision);
                     G.seen.set(id, Date.now());
                     G.failState.delete(id);
                     if (!isActiveGen() || !state.enabled) continue;
-                    G.lastRpcApproveAt = Date.now();
-                    const tierLabel = out.decision === 'allow_always'
-                        ? '永久允许'
-                        : (out.decision === 'allow_once' ? '允许一次' : out.decision);
-                    G.rpcLog.push({ id, title, decision: out.decision, ok: true, at: Date.now() });
-                    if (G.rpcLog.length > 200) G.rpcLog.shift();
-                    recordApproved('rpc', `${tierLabel}${title ? ' · ' + title : ''}`);
-                    console.log(TAG, `✓ [协议直批 ${tierLabel}]`, id, title);
+                    // v7.2.0：批完不立刻计数，先入对账队列；下一轮名单里消失才算真批成（confirmVerified）
+                    G.pendingVerify.set(id, { at: Date.now(), title, decision: out.decision, uncertain: false });
+                    console.log(TAG, '✓ [协议已批，待对账]', id, title, out.decision);
                 } catch (err) {
                     const prev = G.failState.get(id) || { count: 0, nextTryAt: 0 };
                     const count = prev.count + 1;
@@ -1283,6 +1341,12 @@
                     G.failState.set(id, { count, nextTryAt: Date.now() + backoff });
                     if (err && err.code === 'RPC_TIMEOUT') {
                         G.rpcUncertainUntil = Math.max(G.rpcUncertainUntil || 0, Date.now() + 20000);
+                    }
+                    // v7.2.0：连接失败/超时属于「结果不确定」——也许服务端已批；入对账队列，下一轮看名单定性
+                    if (isConnectionError(err) || (err && err.code === 'RPC_TIMEOUT')) {
+                        if (!G.pendingVerify.has(id)) {
+                            G.pendingVerify.set(id, { at: Date.now(), title, decision: state.decision, uncertain: true });
+                        }
                     }
                     if (!isActiveGen() || !state.enabled) continue;
                     const msg = (err && err.message) ? err.message : String(err);
@@ -1298,12 +1362,15 @@
                         nextDelay = nextRpcBackoffMs(rpcConsecutiveFails);
                         if (err && err.code === 'RPC_TIMEOUT') nextDelay = Math.max(nextDelay, 15000);
                         reportRpcFailure('连不上', err, nextDelay);
+                        loopCompleted = false;
                         break;
                     }
                 } finally {
                     G.inFlight.delete(id);
                 }
             }
+
+            if (loopCompleted) reconcileVerify(activeIds);
 
             pruneRpcMaps(activeIds);
         } catch (e) {
@@ -1620,6 +1687,7 @@
                     domSuppressedUntil.set(target, until);
                 }
                 if (now < until) {
+                    noteDomSkip(extractVisibleText(target), '协议在线且页面点击连续无效，抑制中');
                     if (!domFailureSuppressed.has(target)) {
                     domFailureSuppressed.add(target);
                     console.warn(TAG, `⚠ 协议在线时页面按钮「${extractVisibleText(target)}」已连续无效 ${priorFails} 次，暂停重复点击；协议离线时会恢复兜底`);
@@ -1634,7 +1702,7 @@
             if (isDisabledButton(target) || domPendingVerify.has(target)) return;
             const lastClick = domCooldownMap.get(target) || 0;
             const retryDelay = priorFails > 0 ? Math.min(2000 * Math.pow(2, Math.min(priorFails - 1, 4)), 30000) : 1500;
-            if (now - lastClick < retryDelay) return;
+            if (now - lastClick < retryDelay) { noteDomSkip(extractVisibleText(target), '重试冷却中'); return; }
 
             const rawText = extractVisibleText(target);
             const tier = classifyButtonTier(rawText);
@@ -1658,7 +1726,7 @@
             }
 
             const ctx = verifyApprovalContext(target);
-            if (!ctx.ok) return;
+            if (!ctx.ok) { noteDomSkip(rawText, '无审批上下文'); return; }
 
             best = { target, rawText, tier, clue: ctx.clue };
         };
@@ -1781,6 +1849,7 @@
 
         const now = Date.now();
         if (isTop && (G.inFlight.size > 0 || now < G.rpcUncertainUntil)) {
+            noteDomSkip('', '等协议结果，页面点击让行');
             if (!owned.domDeferTimer) {
                 const waitMs = G.inFlight.size > 0 ? 700 : Math.min(1500, Math.max(250, G.rpcUncertainUntil - now));
                 owned.domDeferTimer = setTimeout(() => {
@@ -2059,6 +2128,8 @@
             connectionState: pendingCtx ? pendingCtx.connectionState : null,
             activeShadows: getActiveShadowRoots().length,
             inFlight: G.inFlight.size,
+            pendingVerify: G.pendingVerify ? G.pendingVerify.size : 0,
+            domSkipLog: (G.domSkipLog || []).slice(-10),
         };
         console.log(TAG, '诊断信息:', info);
         return info;
